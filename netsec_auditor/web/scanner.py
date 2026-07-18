@@ -19,6 +19,7 @@ from bs4 import BeautifulSoup
 from cryptography import x509
 
 from netsec_auditor.scanner.scope import Scope
+from netsec_auditor.utils.hashing import short_id
 from netsec_auditor.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -200,19 +201,21 @@ class WebScanner:
         max_redirects: int = 5,
         user_agent: str = "NetSec-Auditor/1.0 (Authorized Security Scan)",
         concurrency: int = 10,
+        verify_tls: bool = False,
     ) -> None:
         self.scope = scope
         self.timeout = timeout
         self.max_redirects = max_redirects
         self.concurrency = concurrency
-        # TLS verification is intentionally disabled: scan targets frequently
-        # present invalid/self-signed certs, which _analyze_ssl reports separately.
+        # Certificate validation defaults off: scan targets routinely present
+        # invalid/self-signed certs, which _analyze_ssl reports as findings.
+        # Callers auditing only trusted hosts can pass verify_tls=True.
         self._client = httpx.AsyncClient(
             timeout=timeout,
             follow_redirects=True,
             max_redirects=max_redirects,
             headers={"User-Agent": user_agent},
-            verify=False,
+            verify=verify_tls,
         )
 
     async def scan(self, url: str, deep: bool = False) -> WebScanResult:
@@ -308,7 +311,7 @@ class WebScanner:
             if header not in response.headers:
                 vulns.append(
                     WebVulnerability(
-                        id=f"HEADER-MISSING-{hashlib.md5(header.encode()).hexdigest()[:8]}",
+                        id=f"HEADER-MISSING-{short_id(header)}",
                         name=f"Missing security header: {header}",
                         description=info["description"],
                         severity=info["severity"],
@@ -322,7 +325,7 @@ class WebScanner:
         if "Server" in response.headers:
             vulns.append(
                 WebVulnerability(
-                    id=f"HEADER-SERVER-{hashlib.md5(url.encode()).hexdigest()[:8]}",
+                    id=f"HEADER-SERVER-{short_id(url)}",
                     name="Server header exposes version information",
                     description=f"Server header reveals: {response.headers['Server']}",
                     severity="low",
@@ -336,7 +339,7 @@ class WebScanner:
         if "X-Powered-By" in response.headers:
             vulns.append(
                 WebVulnerability(
-                    id=f"HEADER-POWERED-{hashlib.md5(url.encode()).hexdigest()[:8]}",
+                    id=f"HEADER-POWERED-{short_id(url)}",
                     name="X-Powered-By header exposes technology",
                     description=f"X-Powered-By reveals: {response.headers['X-Powered-By']}",
                     severity="low",
@@ -393,7 +396,7 @@ class WebScanner:
             for match in matches[:3]:
                 vulns.append(
                     WebVulnerability(
-                        id=f"INFO-DISC-{hashlib.md5(match.encode()).hexdigest()[:8]}",
+                        id=f"INFO-DISC-{short_id(match)}",
                         name=description,
                         description=f"Found: {match[:100]}",
                         severity=severity,
@@ -422,7 +425,7 @@ class WebScanner:
                 continue
             vulns.append(
                 WebVulnerability(
-                    id=f"HTTP-METHOD-{method}-{hashlib.md5(url.encode()).hexdigest()[:8]}",
+                    id=f"HTTP-METHOD-{method}-{short_id(url)}",
                     name=desc,
                     description=f"HTTP {method} returned status {resp.status_code}",
                     severity=severity,
@@ -451,7 +454,7 @@ class WebScanner:
             if "httponly" not in cookie_lower:
                 vulns.append(
                     WebVulnerability(
-                        id=f"COOKIE-NO-HTTPONLY-{hashlib.md5(cookie_str.encode()).hexdigest()[:8]}",
+                        id=f"COOKIE-NO-HTTPONLY-{short_id(cookie_str)}",
                         name="Cookie missing HttpOnly flag",
                         description=(
                             "Cookie without HttpOnly can be accessed by "
@@ -469,7 +472,7 @@ class WebScanner:
             if "secure" not in cookie_lower:
                 vulns.append(
                     WebVulnerability(
-                        id=f"COOKIE-NO-SECURE-{hashlib.md5(cookie_str.encode()).hexdigest()[:8]}",
+                        id=f"COOKIE-NO-SECURE-{short_id(cookie_str)}",
                         name="Cookie missing Secure flag",
                         description="Cookie without Secure can be transmitted over HTTP",
                         severity="medium",
@@ -484,7 +487,7 @@ class WebScanner:
             if "samesite" not in cookie_lower:
                 vulns.append(
                     WebVulnerability(
-                        id=f"COOKIE-NO-SAMESITE-{hashlib.md5(cookie_str.encode()).hexdigest()[:8]}",
+                        id=f"COOKIE-NO-SAMESITE-{short_id(cookie_str)}",
                         name="Cookie missing SameSite attribute",
                         description="Cookie without SameSite is vulnerable to CSRF",
                         severity="low",
@@ -507,7 +510,7 @@ class WebScanner:
         result = await scan_tls(hostname, port, self.timeout)
         vulns: list[WebVulnerability] = []
         for finding in result.get("findings", []):
-            digest = hashlib.md5((finding["name"] + url).encode()).hexdigest()[:8]
+            digest = short_id(finding["name"] + url)
             vulns.append(
                 WebVulnerability(
                     id=f"TLS-{digest}",

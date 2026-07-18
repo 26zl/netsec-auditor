@@ -14,6 +14,9 @@ import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+from defusedxml.common import DefusedXmlException
+from defusedxml.ElementTree import fromstring as safe_fromstring
+
 from netsec_auditor.wireless.base import AccessPoint, assess_access_point
 
 # A colon- or dash-separated 48-bit MAC/BSSID.
@@ -275,8 +278,9 @@ def _parse_xml(text: str) -> ET.Element | None:
     if not cleaned:
         return None
     try:
-        return ET.fromstring(cleaned)
-    except ET.ParseError:
+        # defusedxml forbids DTDs/entities (XXE, billion-laughs) in operator files.
+        return safe_fromstring(cleaned)
+    except (ET.ParseError, DefusedXmlException):
         return None
 
 

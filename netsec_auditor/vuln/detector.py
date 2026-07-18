@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import importlib.resources
 import json
 import re
@@ -17,6 +16,7 @@ import httpx
 import yaml
 
 from netsec_auditor.scanner.engine import HostResult, ServiceInfo
+from netsec_auditor.utils.hashing import short_id
 from netsec_auditor.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -200,7 +200,7 @@ class VulnerabilityDatabase:
 
     def _rule_to_vuln(self, rule: dict[str, Any]) -> Vulnerability:
         return Vulnerability(
-            id=rule.get("id", hashlib.md5(rule.get("name", "").encode()).hexdigest()[:12]),
+            id=rule.get("id", short_id(rule.get("name", ""), 12)),
             name=rule.get("name", "Unknown"),
             description=rule.get("description", ""),
             severity=Severity(rule.get("severity", "info")),
@@ -401,7 +401,7 @@ class CVEQueryClient:
 
     async def search_cve(self, keyword: str, limit: int = 20) -> list[dict[str, Any]]:
         """Search CVEs by keyword (product name, vendor, etc.)."""
-        cache_key = hashlib.md5(f"search:{keyword}:{limit}".encode()).hexdigest()
+        cache_key = short_id(f"search:{keyword}:{limit}", 32)
         cached = self._load_cache(cache_key)
         if cached is not None:
             return cached
