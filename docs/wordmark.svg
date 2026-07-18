@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1010" height="170" viewBox="0 0 1010 170">
+  <rect x="3" y="3" width="1004" height="164" rx="26" fill="#0b1a2c" stroke="#1c3b57" stroke-width="3"/>
+  <text xml:space="preserve" x="30" y="48" fill="#22d3ee"
+        font-family="'DejaVu Sans Mono','Menlo','Courier New',monospace"
+        font-size="22" font-weight="bold"><tspan x="30" dy="0">    _   __     __  _____              ___             ___ __</tspan><tspan x="30" dy="22">   / | / /__  / /_/ ___/___  _____   /   | __  ______/ (_) /_____  _____</tspan><tspan x="30" dy="22">  /  |/ / _ \/ __/\__ \/ _ \/ ___/  / /| |/ / / / __  / / __/ __ \/ ___/</tspan><tspan x="30" dy="22"> / /|  /  __/ /_ ___/ /  __/ /__   / ___ / /_/ / /_/ / / /_/ /_/ / /</tspan><tspan x="30" dy="22">/_/ |_/\___/\__//____/\___/\___/  /_/  |_\__,_/\__,_/_/\__/\____/_/</tspan></text>
+</svg>

@@ -1,0 +1,126 @@
+# Vulnerability signature rules. Matched against nmap-detected service name,
+# product, and version. Presence-only rules (no version/product condition) are
+# heuristics that flag exposure and should be confirmed manually or via nmap NSE.
+rules:
+  - id: "CVE-2021-44228"
+    name: "Log4Shell — Remote Code Execution (CVE-2021-44228)"
+    description: "Apache Log4j2 JNDI features do not protect against attacker-controlled LDAP and other JNDI related endpoints."
+    severity: "critical"
+    category: "cve"
+    cvss_score: 10.0
+    cve_id: "CVE-2021-44228"
+    conditions:
+      service_name: "http"
+      product: ".*[Ll]og4j.*"
+    remediation: "Upgrade to Log4j 2.17.0+ or apply vendor patches immediately."
+    references:
+      - "https://nvd.nist.gov/vuln/detail/CVE-2021-44228"
+      - "https://logging.apache.org/log4j/2.x/security.html"
+    exploit_available: true
+    metasploit_module: "exploit/multi/http/log4shell_header_injection"
+
+  - id: "CVE-2021-41773"
+    name: "Apache HTTP Server Path Traversal (CVE-2021-41773)"
+    description: "Path traversal vulnerability in Apache HTTP Server 2.4.49 allowing directory traversal and RCE."
+    severity: "critical"
+    category: "cve"
+    cvss_score: 9.8
+    cve_id: "CVE-2021-41773"
+    conditions:
+      service_name: "http"
+      product: "Apache httpd"
+      version: "^2\\.4\\.49(?:$|[^.0-9].*)"
+    remediation: "Upgrade to Apache HTTP Server 2.4.50 or later."
+    references:
+      - "https://nvd.nist.gov/vuln/detail/CVE-2021-41773"
+    exploit_available: true
+
+  - id: "MYSQL-OLD"
+    name: "MySQL version potentially vulnerable"
+    description: "MySQL versions below 8.0.33 have known vulnerabilities."
+    severity: "high"
+    category: "outdated_software"
+    cvss_score: 7.5
+    conditions:
+      service_name: "mysql"
+      version_lt: "8.0.33"
+    remediation: "Upgrade MySQL to version 8.0.33 or later."
+    references:
+      - "https://dev.mysql.com/doc/relnotes/mysql/8.0/en/"
+
+  - id: "POSTGRES-OLD"
+    name: "PostgreSQL version potentially vulnerable"
+    description: "PostgreSQL versions below 15.3 have known vulnerabilities."
+    severity: "high"
+    category: "outdated_software"
+    cvss_score: 7.5
+    conditions:
+      service_name: "postgresql"
+      version_lt: "15.3"
+    remediation: "Upgrade PostgreSQL to version 15.3 or later."
+    references:
+      - "https://www.postgresql.org/support/security/"
+
+  - id: "REDIS-NO-AUTH"
+    name: "Redis potentially exposed without authentication"
+    description: "Redis is reachable on the network; verify that password authentication (requirepass) is enabled."
+    severity: "high"
+    category: "misconfiguration"
+    cvss_score: 7.5
+    conditions:
+      service_name: "redis"
+    remediation: "Enable Redis authentication with the requirepass directive and bind to localhost."
+    references:
+      - "https://redis.io/docs/management/security/"
+
+  - id: "MONGODB-NO-AUTH"
+    name: "MongoDB potentially exposed without authentication"
+    description: "MongoDB is reachable on the network; verify that authentication and authorization are enabled."
+    severity: "high"
+    category: "misconfiguration"
+    cvss_score: 7.5
+    conditions:
+      service_name: "mongodb"
+    remediation: "Enable MongoDB authentication and authorization, and bind to localhost."
+    references:
+      - "https://www.mongodb.com/docs/manual/security/"
+
+  - id: "TOMCAT-OLD"
+    name: "Apache Tomcat version potentially vulnerable"
+    description: "Apache Tomcat versions below 9.0.75 have known vulnerabilities."
+    severity: "high"
+    category: "outdated_software"
+    cvss_score: 7.0
+    conditions:
+      service_name: "http"
+      product: "Apache Tomcat"
+      version_lt: "9.0.75"
+    remediation: "Upgrade Apache Tomcat to version 9.0.75 or later."
+    references:
+      - "https://tomcat.apache.org/security.html"
+
+  - id: "NGINX-OLD"
+    name: "nginx version potentially vulnerable"
+    description: "nginx versions below 1.24.0 have known vulnerabilities."
+    severity: "medium"
+    category: "outdated_software"
+    cvss_score: 5.0
+    conditions:
+      service_name: "http"
+      product: "nginx"
+      version_lt: "1.24.0"
+    remediation: "Upgrade nginx to version 1.24.0 or later."
+    references:
+      - "https://nginx.org/en/security_advisories.html"
+
+  - id: "RDP-EXPOSED"
+    name: "RDP exposed — verify Network Level Authentication"
+    description: "RDP is reachable on the network. Without NLA it is exposed to brute force and BlueKeep-class exploitation."
+    severity: "high"
+    category: "misconfiguration"
+    cvss_score: 7.5
+    conditions:
+      service_name: "ms-wbt-server"
+    remediation: "Enable Network Level Authentication (NLA), restrict RDP with a firewall, and require VPN access."
+    references:
+      - "https://learn.microsoft.com/en-us/windows-server/remote/remote-desktop-services/rds-plan-secure-connections"

@@ -1,0 +1,25 @@
+name: "example-engagement"
+description: "Example scope for authorized penetration testing engagement"
+cidr_ranges:
+  - "10.0.0.0/24"
+  - "192.168.1.0/24"
+domains:
+  - "example.com"
+  - "*.example.com"
+ip_addresses:
+  - "203.0.113.10"
+  - "203.0.113.11"
+excluded_cidr_ranges:
+  - "10.0.0.0/28"
+excluded_domains:
+  - "prod.example.com"
+excluded_ip_addresses:
+  - "203.0.113.99"
+# Explicit allow-list of ports (NOT a range). Omit or set to null to allow all
+# ports; when set, only the listed ports are scanned.
+allowed_ports: null
+# Max host-scans initiated per second (rate limiting for fragile networks/OT).
+max_scan_rate: 100
+authorized_by: "security@example.com"
+authorization_date: "2025-01-01"
+authorization_ref: "TICKET-12345"

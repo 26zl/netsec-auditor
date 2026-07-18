@@ -1,0 +1,41 @@
+# Version control
+.git
+.gitignore
+
+# Python bytecode / build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+*.whl
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Tests (not part of the installed package)
+tests/
+
+# Docker
+Dockerfile
+.dockerignore
+
+# Development and OS files
+.github/
+.vscode/
+.claude/
+.DS_Store
+
+# Local env / secrets / tool output
+.env
+reports/

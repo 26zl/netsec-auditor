@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="480" height="560" viewBox="0 0 480 560">
+  <defs>
+    <linearGradient id="shield" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1b3a59"/>
+      <stop offset="1" stop-color="#102639"/>
+    </linearGradient>
+  </defs>
+  <!-- rounded card keeps the mark legible on light and dark backgrounds -->
+  <rect x="8" y="8" width="464" height="544" rx="52" fill="#0b1a2c" stroke="#1c3b57" stroke-width="4"/>
+  <!-- shield body -->
+  <path d="M240 44 L428 116 V300 C428 410 346 486 240 522 C134 486 52 410 52 300 V116 Z"
+        fill="url(#shield)" stroke="#22d3ee" stroke-width="15"/>
+  <!-- radar rings -->
+  <g fill="none" stroke="#2ee06b" stroke-width="7">
+    <circle cx="240" cy="274" r="50"/>
+    <circle cx="240" cy="274" r="100"/>
+    <circle cx="240" cy="274" r="150"/>
+  </g>
+  <!-- crosshair -->
+  <g stroke="#2ee06b" stroke-width="5" opacity="0.55">
+    <line x1="240" y1="128" x2="240" y2="420"/>
+    <line x1="92" y1="274" x2="388" y2="274"/>
+  </g>
+  <!-- sweep wedge -->
+  <path d="M240 274 L240 124 A150 150 0 0 1 370 200 Z" fill="#22d3ee" opacity="0.42"/>
+  <!-- detected blip -->
+  <circle cx="312" cy="214" r="15" fill="#f43f5e"/>
+</svg>

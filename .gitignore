@@ -1,0 +1,62 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+*.whl
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Tool output (runtime); NOT the packaged netsec_auditor/data/ rules + template
+/reports/
+.netsec-auditor/
+
+# Environment / secrets
+.env
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Python version
+.python-version
+
+# Type checker caches
+.dmypy.json
+.pyre/
+.pytype/
+
+# pip
+pip-wheel-metadata/
+
+# Logs
+*.log
+
+# Profiling
+*.prof
+
+# PCAP captures
+*.pcap
+*.pcapng
+
+# User-generated scope files (example is tracked)
+*-scope.yaml
+!config/example-scope.yaml
+
+.claude/
