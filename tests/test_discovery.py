@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from netsec_auditor.discovery.fast import batched, expand_targets, fast_discover
+from netsec_auditor.discovery.fast import TargetLimitError, batched, expand_targets, fast_discover
 from netsec_auditor.discovery.passive import PassiveInventory, handle_packet
 
 
@@ -104,6 +104,11 @@ def test_expand_targets_usable_hosts() -> None:
 def test_expand_targets_dedupes_sorts_and_skips_invalid() -> None:
     result = expand_targets(["10.0.0.2", "10.0.0.1", "10.0.0.1", "not-a-cidr", ""])
     assert result == ["10.0.0.1", "10.0.0.2"]
+
+
+def test_expand_targets_rejects_unsafe_size() -> None:
+    with pytest.raises(TargetLimitError):
+        expand_targets(["10.0.0.0/24"], max_targets=10)
 
 
 def test_batched_chunks() -> None:

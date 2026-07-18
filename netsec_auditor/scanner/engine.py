@@ -12,7 +12,9 @@ from enum import Enum
 import nmap
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn
 
-from netsec_auditor.scanner.scope import Scope
+from netsec_auditor.discovery.fast import MAX_EXPANDED_TARGETS, TargetLimitError, fast_discover
+from netsec_auditor.profiles import OT_PORTS
+from netsec_auditor.scanner.scope import Scope, ScopeError
 from netsec_auditor.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -230,12 +232,21 @@ class PortScanner:
         timing_template: int = 4,
         max_retries: int = 2,
         timeout: int = 60,
+        version_intensity: int = 5,
     ) -> None:
+        if not 0 <= timing_template <= 5:
+            raise ValueError("timing_template must be between 0 and 5")
+        if max_retries < 0:
+            raise ValueError("max_retries cannot be negative")
+        if timeout <= 0:
+            raise ValueError("timeout must be greater than zero")
+        if not 0 <= version_intensity <= 9:
+            raise ValueError("version_intensity must be between 0 and 9")
         self.scope = scope
         self.timing_template = timing_template
         self.max_retries = max_retries
         self.timeout = timeout
-        self._nm = nmap.PortScanner()
+        self.version_intensity = version_intensity
 
     async def scan_host(
         self,
@@ -247,9 +258,61 @@ class PortScanner:
     ) -> HostResult:
         """Scan a single host with scope validation."""
         self.scope.validate_target(target)
+        nm, duration, status = await self._run_nmap(
+            target, ports, scan_type, service_detection, os_detection
+        )
+        if nm is None:
+            return HostResult(ip=target, status=status or "down", scan_duration=duration)
+        return self._parse_nmap_result(nm, target, duration)
+
+    async def _scan_unit(
+        self,
+        target: str,
+        ports: list[int] | None,
+        scan_type: str,
+        service_detection: bool,
+        os_detection: bool,
+    ) -> list[HostResult]:
+        """Scan one host or CIDR in a single nmap process; return every host found.
+
+        A CIDR is handed to nmap as a range (one process, not one per address),
+        so all responding hosts come from that single run. The caller validates
+        scope before calling.
+        """
+        nm, duration, status = await self._run_nmap(
+            target, ports, scan_type, service_detection, os_detection
+        )
+        if nm is None:
+            return [HostResult(ip=target, status=status or "down", scan_duration=duration)]
+        parsed = self._parse_all_hosts(nm, duration)
+        return parsed or [HostResult(ip=target, status="down", scan_duration=duration)]
+
+    async def _run_nmap(
+        self,
+        target: str,
+        ports: list[int] | None,
+        scan_type: str,
+        service_detection: bool,
+        os_detection: bool,
+    ) -> tuple[nmap.PortScanner | None, float, str]:
+        """Build arguments and run one nmap scan against ``target`` (host or CIDR).
+
+        Returns ``(scanner, duration, status)``. ``scanner`` is ``None`` when the
+        scan was skipped (no in-scope ports) or nmap errored, and ``status`` then
+        carries ``"skipped"``/``"error"``. Each call uses its own ``PortScanner``.
+        """
+        scan_type = scan_type.lower()
+        if scan_type not in {"syn", "connect", "udp"}:
+            raise ValueError("scan_type must be one of: syn, connect, udp")
 
         if ports is None:
             ports = COMMON_PORTS
+        if any(
+            not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535
+            for port in ports
+        ):
+            raise ValueError("ports must contain only integers from 1 to 65535")
+        ports = sorted(set(ports))
 
         if self.scope.allowed_ports is not None:
             allowed = [p for p in ports if p in self.scope.allowed_ports]
@@ -260,15 +323,19 @@ class PortScanner:
                 )
             ports = allowed
             if not ports:
-                return HostResult(ip=target, status="skipped")
+                return (None, 0.0, "skipped")
 
+        ot_sensitive = bool(set(ports) & OT_PORTS)
+        timing_template = min(self.timing_template, 2) if ot_sensitive else self.timing_template
+        version_intensity = 0 if ot_sensitive else self.version_intensity
         port_str = ",".join(str(p) for p in ports)
-        scan_flag = {"syn": "-sS", "connect": "-sT", "udp": "-sU"}.get(scan_type.lower(), "-sS")
-        arguments = f"{scan_flag} -T{self.timing_template} --max-retries {self.max_retries}"
+        scan_flag = {"syn": "-sS", "connect": "-sT", "udp": "-sU"}[scan_type]
+        arguments = f"{scan_flag} -T{timing_template} --max-retries {self.max_retries}"
 
         if service_detection:
-            arguments += " -sV --version-intensity 5"
-        if os_detection:
+            arguments += f" -sV --version-intensity {version_intensity}"
+        global_safe_mode = self.timing_template <= 2 and self.version_intensity == 0
+        if os_detection and not ot_sensitive and not global_safe_mode:
             arguments += " -O --osscan-guess"
 
         logger.info("scanning_host", target=target, ports=len(ports), scan_type=scan_type)
@@ -277,21 +344,21 @@ class PortScanner:
         start = time.monotonic()
 
         try:
+            nm = nmap.PortScanner()
             await loop.run_in_executor(
                 None,
-                lambda: self._nm.scan(
+                lambda: nm.scan(
                     hosts=target,
                     ports=port_str,
                     arguments=arguments,
                     timeout=self.timeout,
                 ),
             )
-        except nmap.PortScannerError as e:
+        except (nmap.PortScannerError, nmap.PortScannerTimeout, OSError) as e:
             logger.error("nmap_error", target=target, error=str(e))
-            return HostResult(ip=target, status="error", scan_duration=time.monotonic() - start)
+            return (None, time.monotonic() - start, "error")
 
-        duration = time.monotonic() - start
-        return self._parse_nmap_result(target, duration)
+        return (nm, time.monotonic() - start, "")
 
     async def scan_network(
         self,
@@ -305,6 +372,31 @@ class PortScanner:
         """Scan multiple hosts concurrently, honouring the scope's scan-rate cap."""
         start_time = time.monotonic()
 
+        if concurrency < 1:
+            raise ValueError("concurrency must be at least one")
+
+        scan_units: list[str] = []
+        total_addresses = 0
+        for target in targets:
+            self.scope.validate_target(target)
+            host = self.scope._extract_host(target)
+            if "/" in host:
+                total_addresses += ipaddress.ip_network(host, strict=False).num_addresses
+            else:
+                total_addresses += 1
+            scan_units.append(host)
+            if total_addresses > MAX_EXPANDED_TARGETS:
+                raise TargetLimitError(
+                    f"Scan spans more than the safe limit of {MAX_EXPANDED_TARGETS:,} addresses"
+                )
+        targets = list(dict.fromkeys(scan_units))
+
+        effective_ports = ports if ports is not None else COMMON_PORTS
+        if set(effective_ports) & OT_PORTS:
+            concurrency = 1
+        if self.timing_template <= 2 and self.version_intensity == 0:
+            concurrency = 1
+
         if (scan_type.lower() in ("syn", "udp") or os_detection) and not is_privileged():
             logger.warning(
                 "privileged_scan_without_root",
@@ -315,12 +407,19 @@ class PortScanner:
         semaphore = asyncio.Semaphore(concurrency)
         throttle = _RateLimiter(self.scope.max_scan_rate)
 
-        async def _scan_one(target: str) -> HostResult:
+        async def _scan_one(unit: str) -> list[HostResult]:
             await throttle.acquire()
             async with semaphore:
-                return await self.scan_host(
-                    target, ports, scan_type, service_detection, os_detection
-                )
+                try:
+                    return await self._scan_unit(
+                        unit, ports, scan_type, service_detection, os_detection
+                    )
+                except ScopeError as exc:
+                    logger.warning("target_skipped", target=unit, error=str(exc))
+                    return []
+                except (nmap.PortScannerError, OSError, ValueError) as exc:
+                    logger.error("target_scan_failed", target=unit, error=str(exc))
+                    return [HostResult(ip=unit, status="error")]
 
         with Progress(
             SpinnerColumn(),
@@ -329,36 +428,54 @@ class PortScanner:
             TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
         ) as progress:
             task_id = progress.add_task(
-                f"[cyan]Scanning {len(targets)} hosts...", total=len(targets)
+                f"[cyan]Scanning {len(targets)} targets...", total=len(targets)
             )
 
             tasks = [_scan_one(t) for t in targets]
             results: list[HostResult] = []
 
             for coro in asyncio.as_completed(tasks):
-                result = await coro
-                results.append(result)
+                results.extend(await coro)
                 progress.advance(task_id)
 
         end_time = time.monotonic()
+        results.sort(key=lambda host: host.ip)
         hosts_up = sum(1 for h in results if h.status == "up")
+        hosts_down = sum(1 for h in results if h.status == "down")
 
         return ScanResult(
             hosts=results,
             scan_type=scan_type,
             start_time=start_time,
             end_time=end_time,
-            total_hosts=len(targets),
+            total_hosts=len(results),
             hosts_up=hosts_up,
-            hosts_down=len(targets) - hosts_up,
+            hosts_down=hosts_down,
         )
 
-    def _parse_nmap_result(self, target: str, duration: float) -> HostResult:
-        """Parse nmap scan output into HostResult."""
-        if target not in self._nm.all_hosts():
+    @staticmethod
+    def _parse_nmap_result(
+        nm: nmap.PortScanner, target: str, duration: float
+    ) -> HostResult:
+        """Parse a single-host nmap scan into a HostResult."""
+        scanned_hosts = nm.all_hosts()
+        if not scanned_hosts:
             return HostResult(ip=target, status="down", scan_duration=duration)
+        result_key = target if target in scanned_hosts else scanned_hosts[0]
+        return PortScanner._parse_host_entry(nm, result_key, duration)
 
-        host = self._nm[target]
+    def _parse_all_hosts(self, nm: nmap.PortScanner, duration: float) -> list[HostResult]:
+        """Parse every responding host from a (possibly range) nmap scan."""
+        return [self._parse_host_entry(nm, key, duration) for key in nm.all_hosts()]
+
+    @staticmethod
+    def _parse_host_entry(
+        nm: nmap.PortScanner, result_key: str, duration: float
+    ) -> HostResult:
+        """Build a HostResult from one scanned host entry in ``nm``."""
+        host = nm[result_key]
+        addresses = host.get("addresses", {})
+        address = addresses.get("ipv4") or addresses.get("ipv6") or result_key
         hostname = host.hostname() or ""
         mac = ""
         vendor = ""
@@ -408,7 +525,7 @@ class PortScanner:
                     )
 
         return HostResult(
-            ip=target,
+            ip=address,
             hostname=hostname,
             mac=mac,
             vendor=vendor,
@@ -475,30 +592,19 @@ class NetworkDiscovery:
         privileged nmap ping scan for authoritative discovery.
         """
         self.scope.validate_target(cidr)
-        network = ipaddress.ip_network(cidr, strict=False)
-        hosts = [str(ip) for ip in network.hosts()]
-
-        semaphore = asyncio.Semaphore(100)
-        live: set[str] = set()
-
-        async def _probe(host: str, port: int) -> None:
-            async with semaphore:
-                try:
-                    _reader, writer = await asyncio.wait_for(
-                        asyncio.open_connection(host, port), timeout=1.0
-                    )
-                    writer.close()
-                    await writer.wait_closed()
-                except ConnectionRefusedError:
-                    live.add(host)
-                    return
-                except Exception:
-                    return
-                live.add(host)
-
-        await asyncio.gather(*[_probe(h, p) for h in hosts for p in self.PROBE_PORTS])
-        live_hosts = sorted(live)
-        logger.info("ping_sweep_complete", cidr=cidr, live=len(live_hosts), total=len(hosts))
+        ports = [
+            port
+            for port in self.PROBE_PORTS
+            if self.scope.allowed_ports is None or port in self.scope.allowed_ports
+        ]
+        live_hosts = await fast_discover(
+            [cidr],
+            ports=ports,
+            concurrency=100,
+            timeout=1.0,
+            rate_per_second=self.scope.max_scan_rate,
+        )
+        logger.info("ping_sweep_complete", cidr=cidr, live=len(live_hosts))
         return live_hosts
 
     async def arp_scan(self, cidr: str) -> list[dict[str, str]]:

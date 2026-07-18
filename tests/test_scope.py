@@ -75,6 +75,34 @@ def test_cidr_target_overlapping_exclusion_is_rejected() -> None:
         scope.validate_target("10.0.5.0/25")
 
 
+def test_cidr_target_containing_excluded_ip_is_rejected() -> None:
+    scope = Scope(
+        name="t",
+        cidr_ranges=["10.0.0.0/24"],
+        excluded_ip_addresses=["10.0.0.42"],
+    )
+    with pytest.raises(ScopeError, match="excluded address"):
+        scope.validate_target("10.0.0.0/24")
+
+
+def test_all_dns_answers_must_be_authorized(monkeypatch: pytest.MonkeyPatch) -> None:
+    answers = [
+        (2, 1, 6, "", ("10.0.0.10", 0)),
+        (2, 1, 6, "", ("192.0.2.10", 0)),
+    ]
+    monkeypatch.setattr("socket.getaddrinfo", lambda *_args: answers)
+    scope = Scope(name="t", cidr_ranges=["10.0.0.0/24"])
+    with pytest.raises(ScopeError):
+        scope.validate_target("multi.example")
+
+
+def test_invalid_scope_limits_are_rejected() -> None:
+    with pytest.raises(ScopeError, match="allowed_ports"):
+        Scope(name="t", allowed_ports=[0, 443])
+    with pytest.raises(ScopeError, match="max_scan_rate"):
+        Scope(name="t", max_scan_rate=-1)
+
+
 def test_unresolvable_target_raises() -> None:
     scope = Scope(name="t", cidr_ranges=["10.0.0.0/24"])
     with pytest.raises(ScopeError):

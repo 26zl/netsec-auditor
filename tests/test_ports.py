@@ -22,5 +22,6 @@ def test_explicit_and_range() -> None:
 
 
 def test_invalid_raises_exit() -> None:
-    with pytest.raises(typer.Exit):
-        _parse_ports("notaport")
+    for invalid in ("notaport", "0", "65536", "100-99", "80,", "1-999999999"):
+        with pytest.raises(typer.Exit):
+            _parse_ports(invalid)

@@ -49,6 +49,8 @@ def configure_logging(
         stream=sys.stderr,
         level=log_level,
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
     if log_file:
         file_handler = logging.FileHandler(log_file)

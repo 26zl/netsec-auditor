@@ -7,7 +7,7 @@ name = "netsec-auditor"
 version = "1.0.0"
 description = "Network Security Auditor — authorized infrastructure security scanning and penetration testing toolkit"
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
 requires-python = ">=3.11"
 authors = [{name = "Security Engineering Team"}]
 keywords = [
@@ -20,7 +20,6 @@ classifiers = [
     "Environment :: Console",
     "Intended Audience :: Information Technology",
     "Intended Audience :: System Administrators",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Topic :: Security",
     "Topic :: System :: Networking :: Monitoring",
@@ -79,7 +78,7 @@ netsec-auditor = "netsec_auditor.cli:app"
 include = ["netsec_auditor*"]
 
 [tool.setuptools.package-data]
-netsec_auditor = ["data/*.yaml", "data/*.html"]
+netsec_auditor = ["data/*.yaml", "data/*.html", "data/*.ans", "data/*.txt"]
 
 [tool.ruff]
 line-length = 100

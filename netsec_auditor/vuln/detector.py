@@ -191,12 +191,16 @@ class VulnerabilityDatabase:
     @staticmethod
     def _version_less_than(current: str, target: str) -> bool:
         """Simple semantic version comparison."""
-        try:
-            cur_parts = [int(x) for x in current.replace("v", "").split(".")]
-            tgt_parts = [int(x) for x in target.replace("v", "").split(".")]
-            return cur_parts < tgt_parts
-        except (ValueError, AttributeError):
+        current_match = re.match(r"^[vV]?(\d+(?:\.\d+)*)", current.strip())
+        target_match = re.match(r"^[vV]?(\d+(?:\.\d+)*)", target.strip())
+        if current_match is None or target_match is None:
             return False
+        cur_parts = [int(x) for x in current_match.group(1).split(".")]
+        tgt_parts = [int(x) for x in target_match.group(1).split(".")]
+        width = max(len(cur_parts), len(tgt_parts))
+        return cur_parts + [0] * (width - len(cur_parts)) < tgt_parts + [0] * (
+            width - len(tgt_parts)
+        )
 
     def _rule_to_vuln(self, rule: dict[str, Any]) -> Vulnerability:
         return Vulnerability(
@@ -418,12 +422,15 @@ class CVEQueryClient:
 
     async def get_cve(self, cve_id: str) -> dict[str, Any] | None:
         """Get details for a specific CVE."""
-        cache_key = f"cve:{cve_id}"
+        normalized_id = cve_id.strip().upper()
+        if re.fullmatch(r"CVE-\d{4}-\d{4,}", normalized_id) is None:
+            return None
+        cache_key = short_id(f"cve:{normalized_id}", 32)
         cached = self._load_cache(cache_key)
         if cached:
             return cached[0]
 
-        data = await self._request_nvd({"cveId": cve_id})
+        data = await self._request_nvd({"cveId": normalized_id})
         if data is None:
             return None
         results = self._parse_nvd_response(data)

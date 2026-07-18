@@ -1,8 +1,26 @@
-# NetSec Auditor
+<div align="center">
+
+<pre>
+     __w*=*w__
+ _-=F~`_,.__`~T=-_
+ %  ,r' _j@@@g_  $     _  _     _   ___             _          _ _ _
+ % /  +"`1@@@@@\ 9    | \| |___| |_/ __| ___ __    /_\ _  _ __| (_) |_ ___ _ _
+ %   ' ,"7@@F~  ,9    | .` / -_)  _\__ \/ -_) _|  / _ \ || / _` | |  _/ _ \ '_|
+ %1    [ T 7  ~ [9    |_|\_\___|\__|___/\___\__| /_/ \_\_,_\__,_|_|\__\___/_|
+ 9 .  _  f  _/ , $
+ `L +    =r   - y'    authorized network · OT/ICS · web · wireless auditor
+  ~+ ` =-+-= ` a~
+    ^+_     _aF
+      `^=v=^`
+</pre>
 
 [![CI](https://github.com/26zl/netsec-auditor/actions/workflows/ci.yml/badge.svg)](https://github.com/26zl/netsec-auditor/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
+
+</div>
+
+# NetSec Auditor
 
 One CLI to audit a whole network — IT, cloud, **OT/ICS**, **IoT**, and **Wi-Fi/BLE**
 — from a laptop or a **Kali NetHunter** phone. It performs host discovery, port and
@@ -70,9 +88,9 @@ never sent.
 
 IP-layer scanning, vulnerability intel, web/TLS, OT/ICS + IoT identification, and
 reporting are cross-platform. Full wireless capability is Linux/NetHunter (or
-WSL2 with a USB adapter). Optional external tools — `masscan` (line-rate
-discovery), `tshark`, `testssl.sh`, nmap **NSE** scripts — are used automatically
-when present; run `doctor` to see what's detected.
+WSL2 with a USB adapter). Optional `masscan` accelerates privileged
+`discover --fast` runs. Curated nmap **NSE** checks are available with
+`vuln --nse`; run `doctor` to see which runtime capabilities are available.
 
 **On a plain laptop with built-in Wi-Fi/Bluetooth (no external hardware):**
 everything works except monitor-mode 802.11 capture. The `wifi` command
@@ -84,22 +102,29 @@ external monitor-mode adapter is only needed for frame-level passive capture
 
 ## Installation
 
-```bash
-# Recommended — isolated install with pipx
-pipx install netsec-auditor
-# With BLE recon (bleak) and/or PDF reports (weasyprint)
-pipx install "netsec-auditor[wireless]"     # BLE
-pipx install "netsec-auditor[all]"          # BLE + PDF
+The repository is currently private and version 1.0.0 has not yet been published
+to PyPI or GHCR. The source install below is therefore the currently available
+installation path (repository access is required).
 
+```bash
 # From source
 pip install .
 pip install -e ".[dev]"        # for development
+pipx install .                  # isolated CLI install
+pipx install ".[all]"          # BLE + PDF extras
 
-# One-liner installer (pipx + nmap hint)
-curl -fsSL https://raw.githubusercontent.com/26zl/netsec-auditor/main/scripts/install.sh | sh
+# Local Docker image (nmap bundled)
+docker build -t netsec-auditor:local .
+docker run --rm --net=host netsec-auditor:local scan 10.0.0.5 --scan-type connect
+```
 
-# Docker (nmap bundled)
-docker run --rm --net=host ghcr.io/26zl/netsec-auditor scan 10.0.0.5 --scan-type connect
+After the release workflow has published version 1.0.0, the package installer
+can be used with `pipx install netsec-auditor` (or `netsec-auditor[all]`). The
+one-line installer in `scripts/install.sh` also expects that PyPI release.
+
+```bash
+# Release install (not available until version 1.0.0 is published)
+pipx install netsec-auditor
 ```
 
 ## Usage
@@ -112,7 +137,8 @@ netsec-auditor scan 10.0.0.5 --ports common --scan-type connect
 netsec-auditor discover 192.168.1.0/24 --method both
 
 # Vulnerability assessment, optionally enriched with NVD CVE data
-netsec-auditor vuln 10.0.0.5 --cve-check --nvd-api-key "$NVD_API_KEY"
+# Export NVD_API_KEY in the environment first; avoid placing secrets in shell history.
+netsec-auditor vuln 10.0.0.5 --cve-check
 
 # Web application scan
 netsec-auditor web https://example.com --deep
@@ -166,8 +192,9 @@ site and audit as they go:
 - **Works unprivileged where it can** — `ble`, `wardrive` import, `discover --fast`,
   and connect-scans need no root. Monitor-mode Wi-Fi (`wifi`, `passive`) and SYN/OS
   scans need root and, for 802.11, an external adapter in monitor mode.
-- **OT-safe by default** — the OT profile (gentle, read-only, single-threaded) is
-  auto-selected when industrial ports appear, so fragile PLCs aren't disturbed.
+- **OT-aware safety interlock** — scans that include registered industrial ports
+  and protocol identification use gentle timing, read-only probes and one worker.
+  Validate the profile against the target environment before scanning fragile PLCs.
 - **Gadget integration** — imports **WiGLE CSV (1.4/1.6), GPX and Kismet** exports
   from the ESP32/Flipper tools in the companion
   [gadgets-tools](https://github.com/26zl/gadgets-tools) project.
@@ -180,7 +207,7 @@ Kali blocks bare `pip` (PEP 668), so use **pipx** inside the chroot:
 
 ```bash
 apt install -y nmap pipx bluez           # add: fonts-dejavu libpango-1.0-0 libharfbuzz0b  (only if you want PDF)
-pipx install "netsec-auditor[wireless]"  # or [all] to include PDF
+pipx install ".[wireless]"               # from the source checkout; use [all] for PDF
 netsec-auditor doctor                    # confirm what's available
 ```
 
@@ -189,7 +216,8 @@ netsec-auditor doctor                    # confirm what's available
   — though an AR9271/RTL8812AU adapter is more robust. Run as root inside the chroot.
 - **BLE:** needs `bluetoothd` running; in a user-namespaced chroot, export
   `BLEAK_DBUS_AUTH_UID=<host-uid>` so bleak can reach the host D-Bus.
-- All aarch64 wheels install cleanly — no compiler/toolchain needed.
+- Verify wheel and native-library availability on the specific aarch64/NetHunter
+  image before deployment.
 
 ## Scope files
 

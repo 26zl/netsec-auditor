@@ -1,0 +1,26 @@
+# Normalize line endings: store and check out text files with LF everywhere
+# (this is a Linux/macOS/NetHunter CLI — shell scripts and ANSI art need LF).
+* text=auto eol=lf
+
+# Source & config
+*.py    text diff=python
+*.md    text
+*.toml  text
+*.yaml  text
+*.yml   text
+*.html  text
+*.sh    text eol=lf
+
+# Terminal ANSI art (chafa output): preserve bytes exactly and keep it out of
+# GitHub's language statistics and diffs.
+*.ans   -text linguist-generated
+netsec_auditor/data/wordmark.txt text linguist-generated
+
+# Binary assets
+*.png   binary
+*.pdf   binary
+*.whl   binary
+
+# Keep docs and vendored data from skewing the language breakdown
+docs/**                                   linguist-documentation
+netsec_auditor/data/report-template.html  linguist-vendored

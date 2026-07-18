@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import ipaddress
 import re
 import ssl
 import time
@@ -12,17 +13,26 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
-from urllib.parse import urljoin, urlparse
+from urllib.parse import ParseResult, parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
 import httpx
 from bs4 import BeautifulSoup
 from cryptography import x509
 
-from netsec_auditor.scanner.scope import Scope
+from netsec_auditor.scanner.scope import Scope, ScopeError
 from netsec_auditor.utils.hashing import short_id
 from netsec_auditor.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+def _is_ip_literal(host: str) -> bool:
+    """True if ``host`` is already an IP address (so it needs no DNS pinning)."""
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
 
 
 class HTTPMethod(Enum):
@@ -45,6 +55,7 @@ class HTTPResponse:
     response_time: float = 0.0
     redirect_chain: list[str] = field(default_factory=list)
     cookies: dict[str, str] = field(default_factory=dict)
+    set_cookie_headers: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -153,11 +164,6 @@ class WebScanner:
             "description": "X-Frame-Options missing — clickjacking possible",
             "remediation": "Add 'X-Frame-Options: DENY' or 'SAMEORIGIN'",
         },
-        "X-XSS-Protection": {
-            "severity": "low",
-            "description": "X-XSS-Protection missing",
-            "remediation": "Add 'X-XSS-Protection: 1; mode=block'",
-        },
         "Referrer-Policy": {
             "severity": "low",
             "description": "Referrer-Policy missing — information leakage possible",
@@ -202,31 +208,40 @@ class WebScanner:
         user_agent: str = "NetSec-Auditor/1.0 (Authorized Security Scan)",
         concurrency: int = 10,
         verify_tls: bool = False,
+        max_response_bytes: int = 5 * 1024 * 1024,
     ) -> None:
+        if timeout <= 0:
+            raise ValueError("timeout must be greater than zero")
+        if max_redirects < 0:
+            raise ValueError("max_redirects cannot be negative")
+        if concurrency < 1:
+            raise ValueError("concurrency must be at least one")
+        if max_response_bytes < 1:
+            raise ValueError("max_response_bytes must be at least one")
         self.scope = scope
         self.timeout = timeout
         self.max_redirects = max_redirects
         self.concurrency = concurrency
+        self.max_response_bytes = max_response_bytes
         # Certificate validation defaults off: scan targets routinely present
         # invalid/self-signed certs, which _analyze_ssl reports as findings.
         # Callers auditing only trusted hosts can pass verify_tls=True.
         self._client = httpx.AsyncClient(
             timeout=timeout,
-            follow_redirects=True,
-            max_redirects=max_redirects,
+            follow_redirects=False,
             headers={"User-Agent": user_agent},
             verify=verify_tls,
         )
 
     async def scan(self, url: str, deep: bool = False) -> WebScanResult:
         """Perform a comprehensive web security scan."""
-        self.scope.validate_target(url)
+        parsed, _pin_ip = self._validate_url(url)
+        self._client.cookies.clear()
         start = time.monotonic()
 
-        parsed = urlparse(url)
-        base_url = f"{parsed.scheme}://{parsed.netloc}"
+        base_url = urlunparse(parsed._replace(fragment=""))
 
-        result = WebScanResult(url=base_url)
+        result = WebScanResult(url=self._redact_url(base_url))
 
         # TLS/cert analysis runs first so it works even for old-TLS-only servers
         # that a modern HTTP client cannot GET.
@@ -234,7 +249,7 @@ class WebScanner:
             tls_port = parsed.port or 443
             result.ssl_certificate = await self._analyze_ssl(parsed.hostname, tls_port)
             result.vulnerabilities.extend(
-                await self._check_tls_posture(parsed.hostname, tls_port, base_url)
+                await self._check_tls_posture(parsed.hostname, tls_port, result.url)
             )
 
         response = await self._safe_request("GET", base_url)
@@ -243,15 +258,17 @@ class WebScanner:
             return result
 
         result.headers = response.headers
-        result.server = response.headers.get("Server", "")
+        result.server = response.headers.get("server", "")
         result.cookies = response.cookies
 
         result.technologies = self._fingerprint_technologies(response)
 
-        result.vulnerabilities.extend(self._check_security_headers(response, base_url))
-        result.vulnerabilities.extend(self._check_information_disclosure(response, base_url))
-        result.vulnerabilities.extend(await self._check_http_methods(base_url))
-        result.vulnerabilities.extend(self._check_cookie_security(response, base_url))
+        result.vulnerabilities.extend(self._check_security_headers(response, result.url))
+        result.vulnerabilities.extend(self._check_information_disclosure(response, result.url))
+        result.vulnerabilities.extend(
+            await self._check_http_methods(base_url, finding_url=result.url)
+        )
+        result.vulnerabilities.extend(self._check_cookie_security(response, result.url))
 
         if deep:
             result.forms = await self._discover_forms(response)
@@ -259,31 +276,174 @@ class WebScanner:
             result.discovered_urls = await self._crawl(base_url, response)
 
         result.scan_duration = time.monotonic() - start
-        logger.info("web_scan_complete", url=base_url, vulns=len(result.vulnerabilities))
+        logger.info("web_scan_complete", url=result.url, vulns=len(result.vulnerabilities))
         return result
 
     async def _safe_request(
         self, method: str, url: str, **kwargs: Any
     ) -> HTTPResponse | None:
-        """Make a safe HTTP request with error handling."""
+        """Make a scope-gated, read-only HTTP request with bounded response size."""
+        method = method.upper()
+        if method not in {"GET", "HEAD", "OPTIONS"}:
+            raise ValueError(f"Unsafe HTTP method refused: {method}")
+        follow_redirects = bool(kwargs.pop("follow_redirects", True))
+        current_url = url
+        redirect_chain: list[str] = []
+        current_method = method
         try:
-            resp = await self._client.request(method, url, **kwargs)
-            cookies = {}
-            for key, value in resp.cookies.items():
-                cookies[key] = value
+            for redirect_count in range(self.max_redirects + 1):
+                _parsed, pin_ip = self._validate_url(current_url)
+                request_url, pin_headers, pin_ext = self._pinned_request(current_url, pin_ip)
+                started = time.monotonic()
+                async with self._client.stream(
+                    current_method,
+                    request_url,
+                    headers=pin_headers,
+                    extensions=pin_ext,
+                    follow_redirects=False,
+                    **kwargs,
+                ) as resp:
+                    location = resp.headers.get("location")
+                    if follow_redirects and resp.is_redirect and location:
+                        if redirect_count >= self.max_redirects:
+                            raise httpx.TooManyRedirects(
+                                "Maximum redirect count exceeded", request=resp.request
+                            )
+                        redirect_chain.append(self._redact_url(current_url))
+                        # Resolve the next hop against the logical (hostname) URL, not
+                        # the pinned IP URL, so relative redirects keep the right host.
+                        current_url = urljoin(current_url, location)
+                        if resp.status_code == 303 and current_method != "HEAD":
+                            current_method = "GET"
+                        continue
 
-            return HTTPResponse(
-                status_code=resp.status_code,
-                headers=dict(resp.headers),
-                body=resp.text,
-                body_size=len(resp.content),
-                response_time=resp.elapsed.total_seconds(),
-                redirect_chain=[str(h.url) for h in resp.history],
-                cookies=cookies,
-            )
+                    content = bytearray()
+                    async for chunk in resp.aiter_bytes():
+                        remaining = self.max_response_bytes - len(content)
+                        if remaining <= 0:
+                            break
+                        content.extend(chunk[:remaining])
+                        if len(chunk) > remaining:
+                            break
+
+                    set_cookie_headers = resp.headers.get_list("set-cookie")
+                    return HTTPResponse(
+                        status_code=resp.status_code,
+                        headers=self._sanitize_headers(resp.headers),
+                        body=bytes(content).decode(resp.encoding or "utf-8", "replace"),
+                        body_size=len(content),
+                        response_time=time.monotonic() - started,
+                        redirect_chain=redirect_chain,
+                        cookies=dict.fromkeys(resp.cookies, "[REDACTED]"),
+                        set_cookie_headers=set_cookie_headers,
+                    )
         except (httpx.HTTPError, httpx.TimeoutException) as e:
-            logger.debug("request_failed", url=url, error=str(e))
+            logger.debug("request_failed", url=self._redact_url(url), error=type(e).__name__)
             return None
+        except ScopeError:
+            logger.debug("request_out_of_scope", url=self._redact_url(url))
+            return None
+        return None
+
+    def _validate_url(self, url: str) -> tuple[ParseResult, str | None]:
+        """Validate URL syntax, scope, and port; return ``(parsed, pin_ip)``.
+
+        ``pin_ip`` is a scope-validated address to connect to when the host is a
+        name, so the request cannot be re-resolved to a different (rebound)
+        address between validation and connect; it is None for an IP-literal host.
+        """
+        parsed = urlparse(url)
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+            raise ScopeError("Web scan URLs must use http:// or https:// and include a host")
+        if parsed.username is not None or parsed.password is not None:
+            raise ScopeError("Credentials in web scan URLs are not allowed")
+        try:
+            port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+        except ValueError:
+            raise ScopeError(f"Invalid port in URL: {self._redact_url(url)}") from None
+        ips = self.scope.resolve_in_scope(url)
+        self.scope.validate_port(port)
+        pin_ip = None
+        if ips and not _is_ip_literal(parsed.hostname):
+            pin_ip = str(ips[0])
+        return parsed, pin_ip
+
+    @staticmethod
+    def _pinned_request(
+        url: str, pin_ip: str | None
+    ) -> tuple[str, dict[str, str], dict[str, str]]:
+        """Rewrite ``url`` to connect to ``pin_ip`` while preserving Host and SNI.
+
+        Returns ``(request_url, headers, extensions)``. When ``pin_ip`` is None the
+        URL is returned unchanged with empty overrides.
+        """
+        if pin_ip is None:
+            return url, {}, {}
+        parsed = urlparse(url)
+        host = parsed.hostname or ""
+        try:
+            port = f":{parsed.port}" if parsed.port is not None else ""
+        except ValueError:
+            port = ""
+        authority = f"[{host}]{port}" if ":" in host else f"{host}{port}"
+        pin_netloc = f"[{pin_ip}]{port}" if ":" in pin_ip else f"{pin_ip}{port}"
+        pinned_url = urlunparse(parsed._replace(netloc=pin_netloc))
+        return pinned_url, {"Host": authority}, {"sni_hostname": host}
+
+    @staticmethod
+    def _redact_url(url: str) -> str:
+        """Remove user information and redact every query value before persistence."""
+        parsed = urlparse(url)
+        host = parsed.hostname or ""
+        try:
+            port = f":{parsed.port}" if parsed.port is not None else ""
+        except ValueError:
+            port = ""
+        netloc = f"[{host}]{port}" if ":" in host else f"{host}{port}"
+        query = urlencode([(key, "[REDACTED]") for key, _ in parse_qsl(parsed.query)])
+        return urlunparse((parsed.scheme, netloc, parsed.path, parsed.params, query, ""))
+
+    # Response headers whose values routinely carry credentials or session material.
+    _SENSITIVE_HEADERS = frozenset(
+        {
+            "set-cookie",
+            "authorization",
+            "proxy-authorization",
+            "www-authenticate",
+            "proxy-authenticate",
+        }
+    )
+    # Substrings that mark any header name as secret-bearing (vendor/session tokens).
+    _SENSITIVE_HEADER_MARKERS = (
+        "token",
+        "secret",
+        "api-key",
+        "apikey",
+        "auth",
+        "password",
+        "credential",
+        "session",
+    )
+
+    @classmethod
+    def _sanitize_headers(cls, headers: httpx.Headers) -> dict[str, str]:
+        """Redact response headers that can carry credentials or session data.
+
+        Uses an explicit set plus name-substring markers so vendor tokens such as
+        ``X-Subject-Token`` or ``X-Vault-Token`` are redacted, not just cookies.
+        """
+        sanitized: dict[str, str] = {}
+        for key, value in headers.items():
+            lowered = key.lower()
+            if lowered == "location":
+                sanitized[lowered] = cls._redact_url(value)
+            elif lowered in cls._SENSITIVE_HEADERS or any(
+                marker in lowered for marker in cls._SENSITIVE_HEADER_MARKERS
+            ):
+                sanitized[lowered] = "[REDACTED]"
+            else:
+                sanitized[lowered] = value
+        return sanitized
 
     def _fingerprint_technologies(self, response: HTTPResponse) -> list[str]:
         """Detect web technologies from headers and response body."""
@@ -308,7 +468,9 @@ class WebScanner:
         vulns: list[WebVulnerability] = []
 
         for header, info in self.SECURITY_HEADERS.items():
-            if header not in response.headers:
+            if header == "Strict-Transport-Security" and urlparse(url).scheme != "https":
+                continue
+            if header.lower() not in response.headers:
                 vulns.append(
                     WebVulnerability(
                         id=f"HEADER-MISSING-{short_id(header)}",
@@ -322,30 +484,30 @@ class WebScanner:
                     )
                 )
 
-        if "Server" in response.headers:
+        if "server" in response.headers:
             vulns.append(
                 WebVulnerability(
                     id=f"HEADER-SERVER-{short_id(url)}",
                     name="Server header exposes version information",
-                    description=f"Server header reveals: {response.headers['Server']}",
+                    description=f"Server header reveals: {response.headers['server']}",
                     severity="low",
                     category="information_disclosure",
                     url=url,
-                    evidence=f"Server: {response.headers['Server']}",
+                    evidence=f"Server: {response.headers['server']}",
                     remediation="Remove or obfuscate the Server header",
                 )
             )
 
-        if "X-Powered-By" in response.headers:
+        if "x-powered-by" in response.headers:
             vulns.append(
                 WebVulnerability(
                     id=f"HEADER-POWERED-{short_id(url)}",
                     name="X-Powered-By header exposes technology",
-                    description=f"X-Powered-By reveals: {response.headers['X-Powered-By']}",
+                    description=f"X-Powered-By reveals: {response.headers['x-powered-by']}",
                     severity="low",
                     category="information_disclosure",
                     url=url,
-                    evidence=f"X-Powered-By: {response.headers['X-Powered-By']}",
+                    evidence=f"X-Powered-By: {response.headers['x-powered-by']}",
                     remediation="Remove the X-Powered-By header",
                 )
             )
@@ -393,23 +555,25 @@ class WebScanner:
 
         for pattern, (severity, description, remediation) in patterns.items():
             matches = re.findall(pattern, response.body, re.IGNORECASE)
-            for match in matches[:3]:
+            for index, _match in enumerate(matches[:3]):
                 vulns.append(
                     WebVulnerability(
-                        id=f"INFO-DISC-{short_id(match)}",
+                        id=f"INFO-DISC-{short_id(f'{url}:{description}:{index}')}",
                         name=description,
-                        description=f"Found: {match[:100]}",
+                        description="A matching value was found and redacted from the report.",
                         severity=severity,
                         category="information_disclosure",
                         url=url,
-                        evidence=match[:200],
+                        evidence="Sensitive value detected [REDACTED]",
                         remediation=remediation,
                     )
                 )
 
         return vulns
 
-    async def _check_http_methods(self, url: str) -> list[WebVulnerability]:
+    async def _check_http_methods(
+        self, url: str, finding_url: str | None = None
+    ) -> list[WebVulnerability]:
         """Probe for dangerous HTTP methods using the async client (non-blocking)."""
         vulns: list[WebVulnerability] = []
 
@@ -419,19 +583,27 @@ class WebScanner:
             "TRACE": ("medium", "TRACE method enabled — XST possible", "Disable TRACE method"),
         }
 
+        resp = await self._safe_request("OPTIONS", url, follow_redirects=False)
+        if resp is None:
+            return vulns
+        allowed = {
+            method.strip().upper()
+            for method in resp.headers.get("allow", "").split(",")
+            if method.strip()
+        }
+        display_url = finding_url or self._redact_url(url)
         for method, (severity, desc, remediation) in dangerous_methods.items():
-            resp = await self._safe_request(method, url, follow_redirects=False)
-            if resp is None or not (200 <= resp.status_code < 300):
+            if method not in allowed:
                 continue
             vulns.append(
                 WebVulnerability(
-                    id=f"HTTP-METHOD-{method}-{short_id(url)}",
+                    id=f"HTTP-METHOD-{method}-{short_id(display_url)}",
                     name=desc,
-                    description=f"HTTP {method} returned status {resp.status_code}",
+                    description=f"The server advertised HTTP {method} in its Allow header.",
                     severity=severity,
                     category="http_method",
-                    url=url,
-                    evidence=f"{method} {url} -> {resp.status_code}",
+                    url=display_url,
+                    evidence=f"Allow: {', '.join(sorted(allowed))}",
                     remediation=remediation,
                 )
             )
@@ -444,12 +616,9 @@ class WebScanner:
         """Check for insecure cookie attributes."""
         vulns: list[WebVulnerability] = []
 
-        set_cookie_headers = [
-            v for k, v in response.headers.items() if k.lower() == "set-cookie"
-        ]
-
-        for cookie_str in set_cookie_headers:
+        for cookie_str in response.set_cookie_headers:
             cookie_lower = cookie_str.lower()
+            evidence = self._redact_set_cookie(cookie_str)
 
             if "httponly" not in cookie_lower:
                 vulns.append(
@@ -463,7 +632,7 @@ class WebScanner:
                         severity="medium",
                         category="cookie_security",
                         url=url,
-                        evidence=cookie_str[:200],
+                        evidence=evidence,
                         remediation="Add HttpOnly flag to all cookies",
                         cwe_id="CWE-1004",
                     )
@@ -478,7 +647,7 @@ class WebScanner:
                         severity="medium",
                         category="cookie_security",
                         url=url,
-                        evidence=cookie_str[:200],
+                        evidence=evidence,
                         remediation="Add Secure flag to all cookies",
                         cwe_id="CWE-614",
                     )
@@ -493,13 +662,21 @@ class WebScanner:
                         severity="low",
                         category="cookie_security",
                         url=url,
-                        evidence=cookie_str[:200],
+                        evidence=evidence,
                         remediation="Add SameSite=Lax or SameSite=Strict to cookies",
                         cwe_id="CWE-1275",
                     )
                 )
 
         return vulns
+
+    @staticmethod
+    def _redact_set_cookie(cookie: str) -> str:
+        """Keep cookie attributes while removing its value."""
+        first, separator, attributes = cookie.partition(";")
+        name = first.partition("=")[0].strip() or "cookie"
+        suffix = f";{attributes}" if separator else ""
+        return f"{name}=[REDACTED]{suffix}"[:200]
 
     async def _check_tls_posture(
         self, hostname: str, port: int, url: str
@@ -660,7 +837,9 @@ class WebScanner:
                 if resp and resp.status_code in (200, 301, 302, 403, 401):
                     found.append(f"{url} [{resp.status_code}]")
 
-        await asyncio.gather(*[_check(d) for d in self.COMMON_DIRECTORIES])
+        await asyncio.gather(
+            *[_check(d) for d in self.COMMON_DIRECTORIES], return_exceptions=True
+        )
         return sorted(found)
 
     async def _discover_forms(self, response: HTTPResponse) -> list[dict[str, Any]]:
@@ -670,15 +849,18 @@ class WebScanner:
             soup = BeautifulSoup(response.body, "lxml")
             for form in soup.find_all("form"):
                 form_info: dict[str, Any] = {
-                    "action": form.get("action", ""),
-                    "method": form.get("method", "GET").upper(),
+                    "action": self._redact_url(str(form.get("action", "")))
+                    if form.get("action")
+                    else "",
+                    "method": str(form.get("method", "GET")).upper(),
                     "inputs": [],
                 }
                 for inp in form.find_all(["input", "textarea", "select"]):
+                    value = inp.get("value", "")
                     form_info["inputs"].append({
                         "name": inp.get("name", ""),
                         "type": inp.get("type", "text"),
-                        "value": inp.get("value", ""),
+                        "value": "[REDACTED]" if value else "",
                     })
                 forms.append(form_info)
         except Exception:
@@ -703,7 +885,7 @@ class WebScanner:
                 full_parsed = urlparse(full_url)
 
                 if full_parsed.netloc == parsed_base.netloc:
-                    urls.add(full_url)
+                    urls.add(self._redact_url(full_url))
         except Exception:
             pass
 

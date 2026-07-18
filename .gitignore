@@ -59,5 +59,4 @@ pip-wheel-metadata/
 *-scope.yaml
 !config/example-scope.yaml
 
-# Claude AI
 .claude/

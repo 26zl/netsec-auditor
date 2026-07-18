@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import ipaddress
+import time
 from collections.abc import Iterable, Iterator
 from typing import TypeVar
 
@@ -30,8 +31,28 @@ DEFAULT_PROBE_PORTS: list[int] = [80, 443, 22, 445, 3389, 502, 102, 47808, 8080]
 
 # Hosts are probed in batches of this size to bound concurrent tasks and memory.
 _BATCH_SIZE = 4096
+MAX_EXPANDED_TARGETS = 65_536
 
-# NOTE: masscan can be wrapped here later for line-rate scanning of huge ranges.
+
+class TargetLimitError(ValueError):
+    """Raised when local discovery would expand an unsafe number of targets."""
+
+
+class _StartRateLimiter:
+    def __init__(self, rate_per_second: float) -> None:
+        self._interval = 1.0 / rate_per_second if rate_per_second > 0 else 0.0
+        self._lock = asyncio.Lock()
+        self._next = 0.0
+
+    async def acquire(self) -> None:
+        if self._interval == 0:
+            return
+        async with self._lock:
+            now = time.monotonic()
+            if self._next > now:
+                await asyncio.sleep(self._next - now)
+                now = time.monotonic()
+            self._next = max(self._next, now) + self._interval
 
 
 def batched(iterable: Iterable[T], n: int) -> Iterator[list[T]]:
@@ -60,7 +81,7 @@ def _ip_sort_key(ip: str) -> tuple[int, int, int | str]:
     return (0, addr.version, int(addr))
 
 
-def expand_targets(cidrs: list[str]) -> list[str]:
+def expand_targets(cidrs: list[str], max_targets: int = MAX_EXPANDED_TARGETS) -> list[str]:
     """Expand CIDRs/bare IPs into a sorted, de-duplicated list of host IPs.
 
     Each entry may be a network (``10.0.0.0/24``) or a single address
@@ -68,6 +89,8 @@ def expand_targets(cidrs: list[str]) -> list[str]:
     link, network and broadcast addresses are excluded via
     :meth:`ipaddress.ip_network.hosts`. Invalid entries are logged and skipped.
     """
+    if max_targets < 1:
+        raise ValueError("max_targets must be at least one")
     seen: set[str] = set()
     for raw in cidrs:
         text = raw.strip()
@@ -82,6 +105,10 @@ def expand_targets(cidrs: list[str]) -> list[str]:
         addresses = network if network.num_addresses <= 2 else network.hosts()
         for host in addresses:
             seen.add(str(host))
+            if len(seen) > max_targets:
+                raise TargetLimitError(
+                    f"Target expansion exceeds the safe limit of {max_targets:,} addresses"
+                )
     return sorted(seen, key=_ip_sort_key)
 
 
@@ -106,6 +133,7 @@ async def fast_discover(
     ports: list[int] | None = None,
     concurrency: int = 500,
     timeout: float = 1.0,
+    rate_per_second: float = 0.0,
 ) -> list[str]:
     """Discover live hosts across ``cidrs`` via unprivileged TCP-connect probes.
 
@@ -120,10 +148,19 @@ async def fast_discover(
     if not hosts or not probe_ports:
         return []
 
-    limit = asyncio.Semaphore(max(1, concurrency))
+    if concurrency < 1:
+        raise ValueError("concurrency must be at least one")
+    if timeout <= 0:
+        raise ValueError("timeout must be greater than zero")
+    if rate_per_second < 0:
+        raise ValueError("rate_per_second cannot be negative")
+
+    limit = asyncio.Semaphore(concurrency)
+    throttle = _StartRateLimiter(rate_per_second)
     live: set[str] = set()
 
     async def _probe_host(host: str) -> None:
+        await throttle.acquire()
         for port in probe_ports:
             async with limit:
                 if await _is_reachable(host, port, timeout):

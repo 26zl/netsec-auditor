@@ -340,6 +340,8 @@ async def _run_command(cmd: list[str], timeout: float = 20.0) -> str:
     except TimeoutError:
         with contextlib.suppress(ProcessLookupError):
             proc.kill()
+        with contextlib.suppress(Exception):
+            await proc.wait()
         logger.debug("wifi_command_timeout", cmd=cmd[0])
         return ""
     return stdout.decode("utf-8", "replace")

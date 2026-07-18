@@ -22,12 +22,13 @@ pip install -e ".[dev]"
 
 ## Tests and linting
 
-Everything below runs in CI on every push and pull request; keep it green.
+The test suite and Ruff are required CI checks. Strict mypy also runs, but is
+currently advisory while the existing type backlog is resolved.
 
 ```bash
 pytest                    # test suite
 ruff check .              # lint
-mypy netsec_auditor       # type check (strict)
+mypy netsec_auditor       # strict type check; currently reports known debt
 ```
 
 `ruff` and its rules are configured in `pyproject.toml`. Please add or update a

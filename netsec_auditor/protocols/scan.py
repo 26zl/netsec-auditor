@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 from netsec_auditor.profiles import Profile
 from netsec_auditor.protocols import probers_for_port
@@ -17,6 +18,7 @@ async def identify_services(
     ports: list[int],
     profile: Profile,
     timeout: float = 5.0,
+    rate_per_second: float = 0.0,
 ) -> list[ProbeResult]:
     """Probe each open port that has a registered prober, honouring the profile.
 
@@ -32,11 +34,29 @@ async def identify_services(
     ]
     if not specs:
         return []
+    if timeout <= 0:
+        raise ValueError("timeout must be greater than zero")
+    if rate_per_second < 0:
+        raise ValueError("rate_per_second cannot be negative")
 
     semaphore = asyncio.Semaphore(max(1, profile.max_concurrency))
+    rate_lock = asyncio.Lock()
+    next_start = 0.0
     results: list[ProbeResult] = []
 
+    async def _throttle() -> None:
+        nonlocal next_start
+        if rate_per_second <= 0:
+            return
+        async with rate_lock:
+            now = time.monotonic()
+            if next_start > now:
+                await asyncio.sleep(next_start - now)
+                now = time.monotonic()
+            next_start = max(next_start, now) + 1.0 / rate_per_second
+
     async def _run(spec: ProbeSpec) -> ProbeResult | None:
+        await _throttle()
         async with semaphore:
             if profile.scan_delay:
                 await asyncio.sleep(profile.scan_delay)

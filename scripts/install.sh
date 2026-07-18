@@ -21,7 +21,6 @@ warn() { printf '\033[0;33mwarn:\033[0m %s\n' "$1" >&2; }
 err()  { printf '\033[0;31merror:\033[0m %s\n' "$1" >&2; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
-# ---- nmap: per-OS install hint --------------------------------------------
 nmap_hint() {
   case "$(uname -s)" in
     Linux)
@@ -47,7 +46,6 @@ check_nmap() {
   fi
 }
 
-# ---- install / upgrade the package ----------------------------------------
 install_with_pipx() {
   info "Installing ${PACKAGE} with pipx (isolated)..."
   # pipx install fails if it is already installed; upgrade in that case.

@@ -1,6 +1,5 @@
 # syntax=docker/dockerfile:1
 
-# ---- builder ---------------------------------------------------------------
 # Resolve and install the project + its dependencies into an isolated prefix.
 # Kept in a separate stage so build tools never reach the final image.
 FROM python:3.12-slim AS builder
@@ -20,7 +19,6 @@ WORKDIR /src
 COPY . .
 RUN pip install --prefix=/install .
 
-# ---- runtime ---------------------------------------------------------------
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \

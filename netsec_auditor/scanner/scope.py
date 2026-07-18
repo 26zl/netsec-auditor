@@ -45,49 +45,85 @@ class Scope:
     _parsed_excluded_ips: set[str] = field(default_factory=set, init=False, repr=False)
 
     def __post_init__(self) -> None:
-        for cidr in self.cidr_ranges:
-            self._parsed_cidrs.append(ipaddress.ip_network(cidr, strict=False))
-        for cidr in self.excluded_cidr_ranges:
-            self._parsed_excluded_cidrs.append(ipaddress.ip_network(cidr, strict=False))
-        self._parsed_ips = set(self.ip_addresses)
-        self._parsed_excluded_ips = set(self.excluded_ip_addresses)
+        try:
+            self._parsed_cidrs = [
+                ipaddress.ip_network(cidr, strict=False) for cidr in self.cidr_ranges
+            ]
+            self._parsed_excluded_cidrs = [
+                ipaddress.ip_network(cidr, strict=False) for cidr in self.excluded_cidr_ranges
+            ]
+            self._parsed_ips = {str(ipaddress.ip_address(ip)) for ip in self.ip_addresses}
+            self._parsed_excluded_ips = {
+                str(ipaddress.ip_address(ip)) for ip in self.excluded_ip_addresses
+            }
+        except (TypeError, ValueError) as exc:
+            raise ScopeError(f"Invalid IP address or CIDR in scope: {exc}") from None
+
+        if self.allowed_ports is not None:
+            if not isinstance(self.allowed_ports, list) or any(
+                not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535
+                for port in self.allowed_ports
+            ):
+                raise ScopeError("allowed_ports must contain only integers from 1 to 65535")
+            self.allowed_ports = sorted(set(self.allowed_ports))
+        if not isinstance(self.max_scan_rate, int) or isinstance(self.max_scan_rate, bool):
+            raise ScopeError("max_scan_rate must be an integer")
+        if self.max_scan_rate < 0:
+            raise ScopeError("max_scan_rate cannot be negative")
 
     def validate_target(self, target: str) -> bool:
         """Check if a target is within authorized scope. Raises ScopeError if not.
 
         Accepts bare IPs, hostnames, full URLs, and CIDR ranges.
         """
+        self.resolve_in_scope(target)
+        return True
+
+    def resolve_in_scope(
+        self, target: str
+    ) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+        """Validate ``target`` and return its authorized, resolved IP addresses.
+
+        Returns every resolved address for a host/URL target so a caller can pin a
+        connection to a validated IP (closing the DNS-rebinding window between the
+        scope check and the actual connect), or an empty list for a CIDR target.
+        Raises :class:`ScopeError` if the target is out of scope.
+        """
         host = self._extract_host(target)
 
         if "/" in host:
-            return self._validate_network(host, target)
-
-        ip = self._resolve_to_ip(host)
-
-        for excluded_cidr in self._parsed_excluded_cidrs:
-            if ip in excluded_cidr:
-                raise ScopeError(f"Target {target} ({ip}) is in excluded range {excluded_cidr}")
-
-        if str(ip) in self._parsed_excluded_ips:
-            raise ScopeError(f"Target {target} ({ip}) is explicitly excluded")
+            self._validate_network(host, target)
+            return []
 
         if self._domain_matches(host, self.excluded_domains):
             raise ScopeError(f"Target {target} is an explicitly excluded domain")
 
-        for cidr in self._parsed_cidrs:
-            if ip in cidr:
-                return True
+        ips = self._resolve_to_ips(host)
 
-        if str(ip) in self._parsed_ips:
-            return True
+        for ip in ips:
+            for excluded_cidr in self._parsed_excluded_cidrs:
+                if ip in excluded_cidr:
+                    raise ScopeError(
+                        f"Target {target} ({ip}) is in excluded range {excluded_cidr}"
+                    )
+
+            if str(ip) in self._parsed_excluded_ips:
+                raise ScopeError(f"Target {target} ({ip}) is explicitly excluded")
 
         if self._domain_matches(host, self.domains):
-            return True
+            return list(ips)
+
+        if all(self._ip_is_authorized(ip) for ip in ips):
+            return list(ips)
 
         raise ScopeError(
-            f"Target {target} ({ip}) is NOT in authorized scope. "
+            f"Target {target} ({', '.join(str(ip) for ip in ips)}) is NOT in authorized scope. "
             f"Authorized ranges: {self.cidr_ranges}, domains: {self.domains}"
         )
+
+    def _ip_is_authorized(self, ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+        """Return whether an address is explicitly or range-authorized."""
+        return str(ip) in self._parsed_ips or any(ip in cidr for cidr in self._parsed_cidrs)
 
     def _validate_network(self, network_str: str, target: str) -> bool:
         """Validate a CIDR target: authorized only if fully contained in an in-scope range."""
@@ -100,6 +136,16 @@ class Scope:
             try:
                 if network.overlaps(excluded):
                     raise ScopeError(f"Target range {target} overlaps excluded range {excluded}")
+            except TypeError:
+                continue
+
+        for excluded_ip in self._parsed_excluded_ips:
+            ip = ipaddress.ip_address(excluded_ip)
+            try:
+                if ip in network:
+                    raise ScopeError(
+                        f"Target range {target} contains excluded address {excluded_ip}"
+                    )
             except TypeError:
                 continue
 
@@ -142,9 +188,9 @@ class Scope:
     @staticmethod
     def _domain_matches(host: str, patterns: list[str]) -> bool:
         """Match a host against domain patterns, supporting '*.example.com' wildcards."""
-        host = host.lower()
+        host = host.lower().rstrip(".")
         for pattern in patterns:
-            pattern = pattern.lower()
+            pattern = pattern.lower().rstrip(".")
             if pattern == host:
                 return True
             if pattern.startswith("*.") and host.endswith(pattern[1:]):
@@ -152,26 +198,40 @@ class Scope:
         return False
 
     @staticmethod
-    def _resolve_to_ip(target: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
-        """Resolve a host string to an IP address."""
+    def _resolve_to_ips(
+        target: str,
+    ) -> tuple[ipaddress.IPv4Address | ipaddress.IPv6Address, ...]:
+        """Resolve a host string to every unique IP address returned by DNS."""
         target = target.strip()
         try:
-            return ipaddress.ip_address(target)
+            return (ipaddress.ip_address(target),)
         except ValueError:
             pass
 
         try:
-            resolved = socket.getaddrinfo(target, None)[0][4][0]
-            return ipaddress.ip_address(resolved)
-        except (socket.gaierror, IndexError):
+            resolved = {
+                ipaddress.ip_address(info[4][0]) for info in socket.getaddrinfo(target, None)
+            }
+            if not resolved:
+                raise ScopeError(f"Cannot resolve target: {target}")
+            return tuple(sorted(resolved, key=lambda ip: (ip.version, int(ip))))
+        except (socket.gaierror, IndexError, ValueError):
             raise ScopeError(f"Cannot resolve target: {target}") from None
 
     @classmethod
     def from_yaml(cls, path: Path) -> Scope:
         """Load scope definition from a YAML file."""
-        with open(path) as f:
-            data = yaml.safe_load(f)
-        return cls(**data)
+        try:
+            with path.open(encoding="utf-8") as f:
+                data = yaml.safe_load(f)
+        except (OSError, yaml.YAMLError) as exc:
+            raise ScopeError(f"Cannot load scope file {path}: {exc}") from None
+        if not isinstance(data, dict):
+            raise ScopeError("Scope file must contain a YAML mapping")
+        try:
+            return cls(**data)
+        except TypeError as exc:
+            raise ScopeError(f"Invalid scope schema: {exc}") from None
 
     def to_dict(self) -> dict[str, Any]:
         return {

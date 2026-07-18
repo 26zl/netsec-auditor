@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import importlib.resources
 import json
+import os
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO, TextIO
+from urllib.parse import urlparse
 
 from jinja2 import Environment, select_autoescape
 
@@ -95,6 +97,12 @@ class ReportGenerator:
     def __init__(self, output_dir: Path | None = None) -> None:
         self.output_dir = output_dir or Path("reports")
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        # Keep the report directory private (0700) whether or not it already existed:
+        # reports hold sensitive findings and their filenames leak scan targets.
+        try:
+            self.output_dir.chmod(0o700)
+        except OSError as exc:
+            logger.warning("report_dir_chmod_failed", path=str(self.output_dir), error=str(exc))
 
     def build_report(
         self,
@@ -137,7 +145,7 @@ class ReportGenerator:
                 report.overall_risk_score += vr.risk_score
 
             report.total_vulnerabilities = len(all_vulns)
-            report.vulnerabilities = [v.to_dict() for v in all_vulns]
+            report.vulnerabilities = [self._finding_to_dict(v.to_dict()) for v in all_vulns]
             report.raw_vuln_results = [
                 {
                     "host": vr.host,
@@ -170,12 +178,16 @@ class ReportGenerator:
                 {
                     "url": w.url,
                     "risk_score": w.risk_score,
-                    "vulnerabilities": [v.to_dict() for v in w.vulnerabilities],
+                    "vulnerabilities": [
+                        self._finding_to_dict(v.to_dict()) for v in w.vulnerabilities
+                    ],
                 }
                 for w in web_results
             ]
 
             for web in web_results:
+                report.total_vulnerabilities += len(web.vulnerabilities)
+                report.overall_risk_score += web.risk_score
                 for vuln in web.vulnerabilities:
                     match vuln.severity:
                         case "critical":
@@ -204,8 +216,8 @@ class ReportGenerator:
 
     def generate_json(self, report: AuditReport, filename: str | None = None) -> Path:
         """Generate a JSON report."""
-        filename = filename or f"audit-report-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
-        output_path = self.output_dir / filename
+        filename = filename or f"audit-report-{self._filename_timestamp()}.json"
+        output_path = self._output_path(filename)
 
         data = report.to_dict()
         if report.raw_scan_result:
@@ -215,7 +227,7 @@ class ReportGenerator:
         if report.raw_web_results:
             data["raw_web_results"] = report.raw_web_results
 
-        with open(output_path, "w") as f:
+        with self._open_private_text(output_path) as f:
             json.dump(data, f, indent=2, default=str)
 
         logger.info("json_report_generated", path=str(output_path))
@@ -223,14 +235,14 @@ class ReportGenerator:
 
     def generate_html(self, report: AuditReport, filename: str | None = None) -> Path:
         """Generate an HTML report."""
-        filename = filename or f"audit-report-{datetime.now().strftime('%Y%m%d-%H%M%S')}.html"
-        output_path = self.output_dir / filename
+        filename = filename or f"audit-report-{self._filename_timestamp()}.html"
+        output_path = self._output_path(filename)
 
         env = Environment(autoescape=select_autoescape(["html", "xml"]))
         template = env.from_string(HTML_TEMPLATE)
         html = template.render(report=report)
 
-        with open(output_path, "w") as f:
+        with self._open_private_text(output_path) as f:
             f.write(html)
 
         logger.info("html_report_generated", path=str(output_path))
@@ -240,18 +252,28 @@ class ReportGenerator:
         """Generate a PDF report (requires weasyprint)."""
         try:
             from weasyprint import HTML
-        except ImportError:
-            logger.error("weasyprint_not_installed", hint="pip install weasyprint")
+        except (ImportError, OSError) as exc:
+            logger.warning(
+                "pdf_backend_unavailable",
+                error=str(exc),
+                hint="install the PDF extra and the required Pango/HarfBuzz system libraries",
+            )
             return None
 
-        filename = filename or f"audit-report-{datetime.now().strftime('%Y%m%d-%H%M%S')}.pdf"
-        output_path = self.output_dir / filename
+        filename = filename or f"audit-report-{self._filename_timestamp()}.pdf"
+        output_path = self._output_path(filename)
 
         env = Environment(autoescape=select_autoescape(["html", "xml"]))
         template = env.from_string(HTML_TEMPLATE)
         html = template.render(report=report)
 
-        HTML(string=html).write_pdf(str(output_path))
+        try:
+            pdf = HTML(string=html).write_pdf()
+        except OSError as exc:
+            logger.warning("pdf_generation_unavailable", error=str(exc))
+            return None
+        with self._open_private_binary(output_path) as f:
+            f.write(pdf)
 
         logger.info("pdf_report_generated", path=str(output_path))
         return output_path
@@ -266,8 +288,13 @@ class ReportGenerator:
         identified_services: list[Any] | None = None,
         wireless: Any | None = None,
         cve_priorities: list[dict[str, Any]] | None = None,
+        formats: set[str] | None = None,
     ) -> dict[str, Path]:
         """Generate all report formats."""
+        selected = formats if formats is not None else {"json", "html", "pdf"}
+        unknown = selected - {"json", "html", "pdf"}
+        if unknown:
+            raise ValueError(f"Unsupported report formats: {', '.join(sorted(unknown))}")
         report = self.build_report(
             scan_result, vuln_results, web_results, title, scope_name,
             identified_services=identified_services,
@@ -276,14 +303,45 @@ class ReportGenerator:
         )
 
         paths: dict[str, Path] = {}
-        paths["json"] = self.generate_json(report)
-        paths["html"] = self.generate_html(report)
+        timestamp = self._filename_timestamp()
+        if "json" in selected:
+            paths["json"] = self.generate_json(report, f"audit-report-{timestamp}.json")
+        if "html" in selected:
+            paths["html"] = self.generate_html(report, f"audit-report-{timestamp}.html")
 
-        pdf_path = self.generate_pdf(report)
-        if pdf_path:
-            paths["pdf"] = pdf_path
+        if "pdf" in selected:
+            pdf_path = self.generate_pdf(report, f"audit-report-{timestamp}.pdf")
+            if pdf_path:
+                paths["pdf"] = pdf_path
 
         return paths
+
+    def _output_path(self, filename: str) -> Path:
+        """Resolve a report filename without permitting directory traversal."""
+        candidate = Path(filename)
+        if candidate.name != filename or filename in {"", ".", ".."}:
+            raise ValueError("Report filename must be a plain filename")
+        return self.output_dir / candidate
+
+    @staticmethod
+    def _filename_timestamp() -> str:
+        return datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+
+    @staticmethod
+    def _private_fd(path: Path) -> int:
+        """Create a new report with owner-only permissions and no symlink following."""
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        return os.open(path, flags, 0o600)
+
+    @classmethod
+    def _open_private_text(cls, path: Path) -> TextIO:
+        return os.fdopen(cls._private_fd(path), "w", encoding="utf-8")
+
+    @classmethod
+    def _open_private_binary(cls, path: Path) -> BinaryIO:
+        return os.fdopen(cls._private_fd(path), "wb")
 
     @staticmethod
     def _host_to_dict(host: HostResult) -> dict[str, Any]:
@@ -333,7 +391,9 @@ class ReportGenerator:
             }
             if web.ssl_certificate
             else None,
-            "vulnerabilities": [v.to_dict() for v in web.vulnerabilities],
+            "vulnerabilities": [
+                ReportGenerator._finding_to_dict(v.to_dict()) for v in web.vulnerabilities
+            ],
             "discovered_directories": web.discovered_directories,
             "discovered_urls": web.discovered_urls,
             "forms": web.forms,
@@ -351,3 +411,15 @@ class ReportGenerator:
         if report.summary.medium > 0 or report.summary.low > 3:
             return "LOW"
         return "INFORMATIONAL"
+
+    @staticmethod
+    def _finding_to_dict(finding: dict[str, Any]) -> dict[str, Any]:
+        """Keep only HTTP(S) reference links in generated reports."""
+        sanitized = dict(finding)
+        references = finding.get("references", [])
+        sanitized["references"] = [
+            ref
+            for ref in references
+            if isinstance(ref, str) and urlparse(ref).scheme.lower() in {"http", "https"}
+        ]
+        return sanitized

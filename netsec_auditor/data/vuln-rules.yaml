@@ -29,24 +29,11 @@ rules:
     conditions:
       service_name: "http"
       product: "Apache httpd"
-      version_lt: "2.4.50"
+      version: "^2\\.4\\.49(?:$|[^.0-9].*)"
     remediation: "Upgrade to Apache HTTP Server 2.4.50 or later."
     references:
       - "https://nvd.nist.gov/vuln/detail/CVE-2021-41773"
     exploit_available: true
-
-  - id: "OPENSSH-OLD"
-    name: "OpenSSH version potentially vulnerable"
-    description: "OpenSSH versions below 8.9 have known vulnerabilities including CVE-2023-28531."
-    severity: "high"
-    category: "outdated_software"
-    cvss_score: 7.0
-    conditions:
-      service_name: "ssh"
-      version_lt: "8.9"
-    remediation: "Upgrade OpenSSH to version 9.0 or later."
-    references:
-      - "https://www.openssh.com/security.html"
 
   - id: "MYSQL-OLD"
     name: "MySQL version potentially vulnerable"

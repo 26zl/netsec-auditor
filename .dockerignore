@@ -30,7 +30,7 @@ tests/
 Dockerfile
 .dockerignore
 
-# CI / editor / agent / OS cruft
+# Development and OS files
 .github/
 .vscode/
 .claude/
