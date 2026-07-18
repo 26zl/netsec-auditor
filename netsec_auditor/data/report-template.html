@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Security Audit Report — {{ report.title }}</title>
+    <style>
+        :root {
+            --critical: #dc3545;
+            --high: #fd7e14;
+            --medium: #ffc107;
+            --low: #17a2b8;
+            --info: #6c757d;
+            --bg: #1a1a2e;
+            --card-bg: #16213e;
+            --text: #e0e0e0;
+            --border: #2a2a4a;
+            --accent: #0f3460;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.6;
+        }
+        .container { max-width: 1200px; margin: 0 auto; padding: 2rem; }
+        header {
+            background: linear-gradient(135deg, var(--accent), var(--card-bg));
+            padding: 3rem 2rem;
+            border-bottom: 3px solid var(--border);
+            margin-bottom: 2rem;
+        }
+        header h1 { font-size: 2.5rem; margin-bottom: 0.5rem; }
+        header .meta { color: #888; font-size: 0.9rem; }
+        .summary-cards {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1rem;
+            margin-bottom: 2rem;
+        }
+        .card {
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 1.5rem;
+        }
+        .card h3 { font-size: 0.85rem; text-transform: uppercase; color: #888; margin-bottom: 0.5rem; }
+        .card .value { font-size: 2rem; font-weight: bold; }
+        .card.critical { border-left: 4px solid var(--critical); }
+        .card.high { border-left: 4px solid var(--high); }
+        .card.medium { border-left: 4px solid var(--medium); }
+        .card.low { border-left: 4px solid var(--low); }
+        .card.info { border-left: 4px solid var(--info); }
+        .critical .value { color: var(--critical); }
+        .high .value { color: var(--high); }
+        .medium .value { color: var(--medium); }
+        .low .value { color: var(--low); }
+        .info .value { color: var(--info); }
+        section { margin-bottom: 2rem; }
+        section h2 {
+            font-size: 1.5rem;
+            margin-bottom: 1rem;
+            padding-bottom: 0.5rem;
+            border-bottom: 2px solid var(--border);
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-bottom: 1rem;
+        }
+        th, td {
+            padding: 0.75rem 1rem;
+            text-align: left;
+            border-bottom: 1px solid var(--border);
+        }
+        th { background: var(--accent); font-weight: 600; text-transform: uppercase; font-size: 0.8rem; }
+        tr:hover { background: rgba(255,255,255,0.03); }
+        .severity-badge {
+            display: inline-block;
+            padding: 0.2rem 0.6rem;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        .severity-critical { background: var(--critical); color: white; }
+        .severity-high { background: var(--high); color: white; }
+        .severity-medium { background: var(--medium); color: #333; }
+        .severity-low { background: var(--low); color: white; }
+        .severity-info { background: var(--info); color: white; }
+        .vuln-detail {
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 1.5rem;
+            margin-bottom: 1rem;
+        }
+        .vuln-detail h4 { margin-bottom: 0.5rem; }
+        .vuln-detail .evidence {
+            background: #0a0a1a;
+            padding: 0.75rem;
+            border-radius: 4px;
+            font-family: 'Fira Code', monospace;
+            font-size: 0.85rem;
+            overflow-x: auto;
+            margin: 0.5rem 0;
+        }
+        .vuln-detail .remediation {
+            background: rgba(23, 162, 184, 0.1);
+            border-left: 3px solid var(--low);
+            padding: 0.75rem;
+            border-radius: 4px;
+            margin-top: 0.5rem;
+        }
+        .port-open { color: #28a745; }
+        .port-filtered { color: var(--high); }
+        .port-closed { color: var(--info); }
+        footer {
+            text-align: center;
+            padding: 2rem;
+            color: #666;
+            font-size: 0.85rem;
+            border-top: 1px solid var(--border);
+            margin-top: 3rem;
+        }
+        @media print {
+            body { background: white; color: black; }
+            .card { border: 1px solid #ddd; }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="container">
+            <h1>{{ report.title }}</h1>
+            <p class="meta">
+                Generated: {{ report.generated_at }} |
+                Scope: {{ report.scope_name }} |
+                Duration: {{ report.scan_duration }}
+            </p>
+        </div>
+    </header>
+
+    <div class="container">
+        <div class="summary-cards">
+            <div class="card critical">
+                <h3>Critical</h3>
+                <div class="value">{{ report.summary.critical }}</div>
+            </div>
+            <div class="card high">
+                <h3>High</h3>
+                <div class="value">{{ report.summary.high }}</div>
+            </div>
+            <div class="card medium">
+                <h3>Medium</h3>
+                <div class="value">{{ report.summary.medium }}</div>
+            </div>
+            <div class="card low">
+                <h3>Low</h3>
+                <div class="value">{{ report.summary.low }}</div>
+            </div>
+            <div class="card info">
+                <h3>Info</h3>
+                <div class="value">{{ report.summary.info }}</div>
+            </div>
+        </div>
+
+        <section>
+            <h2>Executive Summary</h2>
+            <div class="card">
+                <p><strong>Total hosts scanned:</strong> {{ report.total_hosts }}</p>
+                <p><strong>Hosts up:</strong> {{ report.hosts_up }}</p>
+                <p><strong>Total vulnerabilities:</strong> {{ report.total_vulnerabilities }}</p>
+                <p><strong>Overall risk score:</strong> {{ "%.1f"|format(report.overall_risk_score) }}</p>
+                <p><strong>Risk level:</strong> {{ report.risk_level }}</p>
+            </div>
+        </section>
+
+        {% if report.hosts %}
+        <section>
+            <h2>Host Scan Results</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Host</th>
+                        <th>Hostname</th>
+                        <th>OS</th>
+                        <th>Open Ports</th>
+                        <th>Status</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for host in report.hosts %}
+                    <tr>
+                        <td>{{ host.ip }}</td>
+                        <td>{{ host.hostname or 'N/A' }}</td>
+                        <td>{{ host.os or 'Unknown' }}</td>
+                        <td>{{ host.open_ports|length }}</td>
+                        <td>{{ host.status }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </section>
+        {% endif %}
+
+        {% if report.vulnerabilities %}
+        <section>
+            <h2>Vulnerabilities</h2>
+            {% for vuln in report.vulnerabilities %}
+            <div class="vuln-detail">
+                <h4>
+                    <span class="severity-badge severity-{{ vuln.severity }}">{{ vuln.severity }}</span>
+                    {{ vuln.name }}
+                </h4>
+                <p>{{ vuln.description }}</p>
+                {% if vuln.affected_host %}
+                <p><strong>Host:</strong> {{ vuln.affected_host }}{% if vuln.affected_port %}:{{ vuln.affected_port }}{% endif %}</p>
+                {% endif %}
+                {% if vuln.evidence %}
+                <div class="evidence">{{ vuln.evidence }}</div>
+                {% endif %}
+                {% if vuln.remediation %}
+                <div class="remediation"><strong>Remediation:</strong> {{ vuln.remediation }}</div>
+                {% endif %}
+                {% if vuln.references %}
+                <p><strong>References:</strong></p>
+                <ul>
+                    {% for ref in vuln.references %}
+                    <li><a href="{{ ref }}" style="color: var(--low);">{{ ref }}</a></li>
+                    {% endfor %}
+                </ul>
+                {% endif %}
+            </div>
+            {% endfor %}
+        </section>
+        {% endif %}
+
+        {% if report.web_results %}
+        <section>
+            <h2>Web Application Results</h2>
+            {% for web in report.web_results %}
+            <div class="card" style="margin-bottom: 1rem;">
+                <h3>{{ web.url }}</h3>
+                <p><strong>Server:</strong> {{ web.server or 'Unknown' }}</p>
+                <p><strong>Technologies:</strong> {{ web.technologies|join(', ') or 'None detected' }}</p>
+                {% if web.ssl_certificate %}
+                <p><strong>SSL:</strong>
+                    {% if web.ssl_certificate.is_expired %}
+                    <span style="color: var(--critical);">EXPIRED</span>
+                    {% else %}
+                    Valid ({{ web.ssl_certificate.days_until_expiry }} days remaining)
+                    {% endif %}
+                </p>
+                {% endif %}
+                {% if web.discovered_directories %}
+                <details>
+                    <summary>Discovered directories ({{ web.discovered_directories|length }})</summary>
+                    <ul>
+                        {% for d in web.discovered_directories[:20] %}
+                        <li>{{ d }}</li>
+                        {% endfor %}
+                    </ul>
+                </details>
+                {% endif %}
+            </div>
+            {% endfor %}
+        </section>
+        {% endif %}
+
+        {% if report.cve_priorities %}
+        <section>
+            <h2>CVE Prioritization (EPSS + CISA KEV)</h2>
+            <table>
+                <thead>
+                    <tr><th>CVE</th><th>Priority</th><th>CVSS</th><th>EPSS %ile</th><th>KEV</th></tr>
+                </thead>
+                <tbody>
+                    {% for c in report.cve_priorities %}
+                    <tr>
+                        <td>{{ c.cve_id }}</td>
+                        <td><span class="severity-badge severity-{{ c.priority }}">{{ c.priority }}</span></td>
+                        <td>{{ "%.1f"|format(c.cvss) }}</td>
+                        <td>{{ "%.0f"|format(c.percentile * 100) }}%</td>
+                        <td>{% if c.in_kev %}<strong style="color: var(--critical);">YES</strong>{% else %}no{% endif %}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </section>
+        {% endif %}
+
+        {% if report.devices %}
+        <section>
+            <h2>OT/ICS &amp; IoT Devices</h2>
+            <table>
+                <thead>
+                    <tr><th>Protocol</th><th>Port</th><th>Type</th><th>Device Info</th></tr>
+                </thead>
+                <tbody>
+                    {% for d in report.devices %}
+                    <tr>
+                        <td>{{ d.protocol }}</td>
+                        <td>{{ d.port }}/{{ d.transport }}</td>
+                        <td>{% if d.is_ot %}OT{% else %}IoT{% endif %}</td>
+                        <td>{{ d.device_info.items()|list|join(', ') }}{{ d.banner }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </section>
+        {% endif %}
+
+        {% if report.access_points %}
+        <section>
+            <h2>Wi-Fi Access Points</h2>
+            <table>
+                <thead>
+                    <tr><th>SSID</th><th>BSSID</th><th>Ch</th><th>Encryption</th><th>Signal</th><th>Issues</th></tr>
+                </thead>
+                <tbody>
+                    {% for ap in report.access_points %}
+                    <tr>
+                        <td>{{ ap.ssid or '(hidden)' }}</td>
+                        <td>{{ ap.bssid }}</td>
+                        <td>{{ ap.channel }}</td>
+                        <td>{{ ap.encryption|upper }}{% if ap.wps %} +WPS{% endif %}</td>
+                        <td>{{ ap.signal_dbm }} dBm</td>
+                        <td>{{ ap.issues|join('; ') }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </section>
+        {% endif %}
+
+        {% if report.ble_devices %}
+        <section>
+            <h2>Bluetooth LE Devices</h2>
+            <table>
+                <thead>
+                    <tr><th>Name</th><th>Address</th><th>RSSI</th><th>Vendor</th><th>Issues</th></tr>
+                </thead>
+                <tbody>
+                    {% for b in report.ble_devices %}
+                    <tr>
+                        <td>{{ b.name or '(unnamed)' }}</td>
+                        <td>{{ b.address }}</td>
+                        <td>{{ b.rssi }}</td>
+                        <td>{{ b.vendor }}</td>
+                        <td>{{ b.issues|join('; ') }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </section>
+        {% endif %}
+    </div>
+
+    <footer>
+        <p>NetSec Auditor — Authorized Security Assessment Tool</p>
+        <p>This report contains confidential security information. Handle with care.</p>
+    </footer>
+</body>
+</html>
