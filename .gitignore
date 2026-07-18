@@ -28,3 +28,36 @@ htmlcov/
 
 # OS / editor
 .DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Python version
+.python-version
+
+# Type checker caches
+.dmypy.json
+.pyre/
+.pytype/
+
+# pip
+pip-wheel-metadata/
+
+# Logs
+*.log
+
+# Profiling
+*.prof
+
+# PCAP captures
+*.pcap
+*.pcapng
+
+# User-generated scope files (example is tracked)
+*-scope.yaml
+!config/example-scope.yaml
+
+# Claude AI
+.claude/

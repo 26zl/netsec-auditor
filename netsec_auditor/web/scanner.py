@@ -227,7 +227,7 @@ class WebScanner:
 
         # TLS/cert analysis runs first so it works even for old-TLS-only servers
         # that a modern HTTP client cannot GET.
-        if parsed.scheme == "https":
+        if parsed.scheme == "https" and parsed.hostname:
             tls_port = parsed.port or 443
             result.ssl_certificate = await self._analyze_ssl(parsed.hostname, tls_port)
             result.vulnerabilities.extend(

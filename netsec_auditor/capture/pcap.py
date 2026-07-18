@@ -21,6 +21,7 @@ import base64
 import binascii
 import re
 from pathlib import Path
+from typing import Any
 
 from netsec_auditor.discovery.passive import PassiveInventory, handle_packet
 from netsec_auditor.utils.logging import get_logger
@@ -54,7 +55,7 @@ _TELNET_RE = re.compile(rb"(?:login|password|username)[ \t]*:", re.IGNORECASE)
 
 
 # Reading the capture (lazy scapy)
-def _read_packets(path: Path) -> object | None:
+def _read_packets(path: Path) -> Any:
     """Read a capture file into a scapy ``PacketList``, or ``None`` on failure.
 
     scapy is imported here so the module loads without it. Returns ``None`` (with
@@ -95,7 +96,7 @@ def load_pcap(path: Path) -> PassiveInventory:
     return inventory
 
 
-def _records_from_packet(pkt: object) -> list[tuple[str, str, int, bytes]]:
+def _records_from_packet(pkt: Any) -> list[tuple[str, str, int, bytes]]:
     """Extract a ``(src_ip, dst_ip, dst_port, payload)`` record from a scapy packet.
 
     A thin scapy adapter: returns one record when the packet carries an IP layer,

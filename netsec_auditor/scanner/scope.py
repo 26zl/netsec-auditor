@@ -5,6 +5,7 @@ from __future__ import annotations
 import ipaddress
 import socket
 from dataclasses import dataclass, field
+from ipaddress import IPv4Network, IPv6Network
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -103,16 +104,24 @@ class Scope:
                 continue
 
         for cidr in self._parsed_cidrs:
-            try:
-                if network.subnet_of(cidr):
-                    return True
-            except TypeError:
-                continue
+            if self._subnet_of(network, cidr):
+                return True
 
         raise ScopeError(
             f"Target range {target} is NOT within authorized scope. "
             f"Authorized ranges: {self.cidr_ranges}"
         )
+
+    @staticmethod
+    def _subnet_of(
+        network: IPv4Network | IPv6Network, cidr: IPv4Network | IPv6Network
+    ) -> bool:
+        """True if ``network`` is a subnet of ``cidr``; mixed IP versions never match."""
+        if isinstance(network, IPv4Network) and isinstance(cidr, IPv4Network):
+            return network.subnet_of(cidr)
+        if isinstance(network, IPv6Network) and isinstance(cidr, IPv6Network):
+            return network.subnet_of(cidr)
+        return False
 
     def validate_port(self, port: int) -> bool:
         """Check if a port is within allowed range."""

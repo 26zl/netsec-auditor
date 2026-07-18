@@ -20,6 +20,7 @@ import ipaddress
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any
 
 from netsec_auditor.profiles import IOT_PORTS, OT_PORTS
 from netsec_auditor.utils.logging import get_logger
@@ -129,7 +130,7 @@ def _as_str(value: object) -> str | None:
     return None if value is None else str(value)
 
 
-def _coerce_port(value: object) -> int | None:
+def _coerce_port(value: Any) -> int | None:
     """Coerce a value to a port ``int`` (or ``None``) without raising."""
     if value is None:
         return None
@@ -182,7 +183,7 @@ def observe_packet(pkt: object) -> PacketObservation | None:
     return _observe_scapy(pkt)
 
 
-def _observe_scapy(pkt: object) -> PacketObservation | None:
+def _observe_scapy(pkt: Any) -> PacketObservation | None:
     """Decode a real scapy packet into a :class:`PacketObservation`."""
     try:
         from scapy.all import IP, TCP, UDP, Ether, IPv6

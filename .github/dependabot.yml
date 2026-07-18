@@ -1,0 +1,25 @@
+version: 2
+updates:
+  # Python dependencies (pyproject.toml). Minor/patch bumps are grouped into one
+  # PR to cut noise; major bumps open separate PRs for review.
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      python-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  # GitHub Actions used in the workflows (actions/checkout, setup-python, ...).
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  # Dockerfile base image.
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
