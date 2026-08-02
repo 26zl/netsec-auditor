@@ -66,6 +66,12 @@ never sent.
 - **Root/sudo** is required for SYN scans (`-sS`, the default), UDP scans, OS
   fingerprinting, ARP discovery, Wi-Fi monitor mode, and passive sniffing. For
   unprivileged scans use `--scan-type connect`.
+  - Running a **pipx**-installed CLI under `sudo` makes Python write root-owned
+    bytecode caches into the user-owned venv, which later breaks `pipx upgrade`
+    with `Permission denied`. Prefix privileged runs to skip the cache —
+    `sudo PYTHONDONTWRITEBYTECODE=1 netsec-auditor passive` — or recover with
+    `sudo chown -R "$(id -un)" ~/.local/pipx/venvs/netsec-auditor`. On macOS the
+    `wifi`/`ble` commands gain nothing from `sudo`, so just run them unprivileged.
 - The **core install has no system-library requirements.** Optional extras:
   `[wireless]` (BLE, needs BlueZ on Linux) and `[pdf]` (PDF reports, needs
   Pango/HarfBuzz). JSON and HTML reports always work without them.
