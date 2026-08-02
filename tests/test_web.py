@@ -194,3 +194,21 @@ async def test_hostname_target_pins_connection_to_validated_ip() -> None:
     # Host header and TLS SNI still carry the original name (vhost-safe).
     assert seen["header_host"] == "scanme.test"
     assert seen["sni"] == "scanme.test"
+
+
+def test_scan_marks_unreachable_host(monkeypatch) -> None:
+    # A host with nothing on the port must be flagged unreachable, not reported
+    # as an audited server with empty fields.
+    import asyncio
+
+    scanner = WebScanner(Scope(name="t", ip_addresses=["192.0.2.1"]))
+
+    async def _no_response(*_a: object, **_k: object) -> None:
+        return None
+
+    scanner._safe_request = _no_response  # type: ignore[method-assign]
+    result = asyncio.run(scanner.scan("http://192.0.2.1"))
+    asyncio.run(scanner.close())
+
+    assert result.reachable is False
+    assert result.server == ""

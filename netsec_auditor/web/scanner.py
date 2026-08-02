@@ -119,6 +119,7 @@ class WebScanResult:
     forms: list[dict[str, Any]] = field(default_factory=list)
     cookies: dict[str, str] = field(default_factory=dict)
     scan_duration: float = 0.0
+    reachable: bool = True  # False when neither HTTP nor TLS answered on the port
 
     @property
     def risk_score(self) -> float:
@@ -262,6 +263,8 @@ class WebScanner:
 
         response = await self._safe_request("GET", base_url)
         if response is None:
+            # No HTTP reply: reachable only if the TLS layer answered (cert obtained).
+            result.reachable = result.ssl_certificate is not None
             result.scan_duration = time.monotonic() - start
             return result
 

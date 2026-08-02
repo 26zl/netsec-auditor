@@ -1745,6 +1745,9 @@ async def _display_cve_priorities(vuln_results) -> list[dict]:
 def _display_web_result(result) -> None:
     """Display web scan result."""
     console.print(f"\n[bold magenta]{escape(result.url)}[/bold magenta]")
+    if not result.reachable:
+        console.print("  [yellow]No response — host down or port closed.[/yellow]")
+        return
     console.print(f"  Server: {escape(result.server) if result.server else 'Unknown'}")
     console.print(
         f"  Technologies: {escape(', '.join(result.technologies)) or 'None detected'}"

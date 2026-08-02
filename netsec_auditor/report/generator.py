@@ -387,6 +387,7 @@ class ReportGenerator:
         return {
             "url": web.url,
             "ip": web.ip,
+            "reachable": web.reachable,
             "server": web.server,
             "technologies": web.technologies,
             "headers": web.headers,
