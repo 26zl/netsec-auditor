@@ -63,7 +63,7 @@ def _read_packets(path: Path) -> Any:
     callers can degrade to an empty result instead of raising.
     """
     try:
-        from scapy.all import rdpcap
+        from scapy.all import PcapReader
     except ImportError:
         logger.warning(
             "pcap_scapy_unavailable",
@@ -72,7 +72,9 @@ def _read_packets(path: Path) -> Any:
         )
         return None
     try:
-        return rdpcap(str(path))
+        # PcapReader iterates lazily, so peak memory is one packet rather than
+        # the whole capture as with rdpcap.
+        return PcapReader(str(path))
     except Exception as exc:  # scapy raises many parse/IO errors; degrade safely
         logger.warning("pcap_read_failed", path=str(path), error=str(exc))
         return None
@@ -121,11 +123,15 @@ def _records_from_packet(pkt: Any) -> list[tuple[str, str, int, bytes]]:
         else:
             return []
         if pkt.haslayer(TCP):
-            dst_port = int(pkt[TCP].dport)
+            src_port, dst_port = int(pkt[TCP].sport), int(pkt[TCP].dport)
         elif pkt.haslayer(UDP):
-            dst_port = int(pkt[UDP].dport)
+            src_port, dst_port = int(pkt[UDP].sport), int(pkt[UDP].dport)
         else:
             return []
+        # Orient the record at the server: a telnet login prompt travels
+        # server -> client, so keying only on the destination port would miss it.
+        if dst_port not in _CREDENTIAL_PORTS and src_port in _CREDENTIAL_PORTS:
+            return [(str(ip_layer.dst), str(ip_layer.src), src_port, payload)]
         return [(str(ip_layer.src), str(ip_layer.dst), dst_port, payload)]
     except Exception:  # defensive: a malformed packet must not stop analysis
         return []
@@ -141,17 +147,24 @@ def analyze_pcap(path: Path) -> dict:
     missing scapy or unreadable file yields an empty, well-formed result.
     """
     inventory = PassiveInventory()
-    records: list[tuple[str, str, int, bytes]] = []
+    credentials: list[dict] = []
     packet_count = 0
 
+    # Scan credentials per packet rather than buffering every payload: a large
+    # capture would otherwise be held in memory twice.
     packets = _read_packets(path)
     if packets is not None:
-        for pkt in packets:
-            packet_count += 1
-            handle_packet(inventory, pkt)
-            records.extend(_records_from_packet(pkt))
-
-    credentials = scan_cleartext_credentials(records)
+        try:
+            for pkt in packets:
+                packet_count += 1
+                handle_packet(inventory, pkt)
+                credentials.extend(scan_cleartext_credentials(_records_from_packet(pkt)))
+        except Exception as exc:  # a truncated capture must not raise past here
+            logger.warning("pcap_scan_aborted", path=str(path), error=str(exc))
+        finally:
+            close = getattr(packets, "close", None)
+            if callable(close):
+                close()
     logger.info(
         "pcap_analyzed",
         path=str(path),
@@ -191,6 +204,10 @@ def scan_cleartext_credentials(
             continue
         findings.extend(_scan_record(dst_ip, port, data))
     return findings
+
+
+# Server ports the credential detectors below dispatch on.
+_CREDENTIAL_PORTS = frozenset({21, 23, 25, 110, 143, 161, 162, 587})
 
 
 def _scan_record(host: str, port: int, payload: bytes) -> list[dict]:
@@ -362,7 +379,7 @@ def _scan_snmp(host: str, port: int, payload: bytes) -> list[dict]:
         shown = community
         severity = "medium" if community == "private" else "low"
     else:
-        shown = f"{community[:1]}***"  # redact a custom (secret) community
+        shown = "[REDACTED]"  # a custom community is a secret; never echo any of it
         severity = "low"
     evidence = f"SNMP community string in cleartext: {shown}"
     return [_finding("snmp", host, port, evidence, severity)]

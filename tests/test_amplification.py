@@ -74,10 +74,30 @@ def test_build_chargen_request_is_single_byte() -> None:
 
 
 def test_build_ssdp_amp_request_is_msearch() -> None:
-    req = build_ssdp_amp_request()
+    req = build_ssdp_amp_request("10.0.0.1", 1900)
     assert b"M-SEARCH" in req
     assert b"ssdp:all" in req
     assert req.startswith(b"M-SEARCH * HTTP/1.1\r\n")
+
+
+def test_build_ssdp_amp_request_addresses_the_target() -> None:
+    # A unicast datagram carrying the multicast HOST header is a UPnP DA 1.1
+    # deviation that strict devices drop, under-reporting the reflector finding.
+    req = build_ssdp_amp_request("10.0.0.1", 1900)
+    assert b"HOST: 10.0.0.1:1900\r\n" in req
+    assert b"239.255.255.250" not in req
+
+
+def test_probe_ssdp_amp_addresses_the_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    sent: list[bytes] = []
+
+    def responder(payload: bytes) -> bytes:
+        sent.append(payload)
+        return b"HTTP/1.1 200 OK\r\n\r\n"
+
+    _patch_udp(monkeypatch, responder)
+    asyncio.run(amplification.probe_ssdp_amp("192.0.2.9", 1900, 0.1))
+    assert sent == [build_ssdp_amp_request("192.0.2.9", 1900)]
 
 
 # SPECS

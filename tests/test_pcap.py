@@ -41,3 +41,14 @@ def test_no_secret_no_findings() -> None:
 
 def test_malformed_records_skipped() -> None:
     assert scan_cleartext_credentials([("bad",), None]) == []  # type: ignore[list-item]
+
+
+def test_telnet_prompt_is_detected_and_attributed_to_the_server() -> None:
+    # Records are oriented at the server (second element), so a login prompt
+    # travelling server -> client is still attributed to the telnet server.
+    from netsec_auditor.capture.pcap import _CREDENTIAL_PORTS, scan_cleartext_credentials
+
+    assert 23 in _CREDENTIAL_PORTS
+    findings = scan_cleartext_credentials([("10.0.0.9", "10.0.0.5", 23, b"\r\nlogin: ")])
+    assert [f["protocol"] for f in findings] == ["telnet"]
+    assert findings[0]["host"] == "10.0.0.5"

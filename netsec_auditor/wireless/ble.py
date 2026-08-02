@@ -1,9 +1,10 @@
 """Passive Bluetooth Low Energy (BLE) recon — read-only IoT device audit.
 
-This module performs a *passive* BLE advertisement scan: it listens for the
-advertising packets devices broadcast and never connects, pairs, writes, or
-otherwise interacts with them. That makes it safe for auditing IoT estates
-without disturbing the devices under test.
+This module reads advertisement data only: it never connects, pairs, writes, or
+otherwise interacts with a device, which makes it safe for auditing IoT estates
+without disturbing them. Note that bleak's default scan mode is *active*, so the
+controller does emit SCAN_REQ packets to solicit scan responses; passive mode is
+not portable (CoreBluetooth has none, BlueZ needs >= 5.56 and a filter).
 
 The live scan needs the optional :mod:`bleak` backend (and a Bluetooth adapter),
 imported lazily so this module imports cleanly without it — :func:`scan_ble`
@@ -16,7 +17,7 @@ are pure and need neither bleak nor a radio, so they are fully unit-testable.
 from __future__ import annotations
 
 from netsec_auditor.utils.logging import get_logger
-from netsec_auditor.wireless.base import BleDevice, assess_ble_device
+from netsec_auditor.wireless.base import BleDevice, assess_ble_device, sanitize_name
 
 logger = get_logger(__name__)
 
@@ -57,6 +58,7 @@ def build_ble_device(
     rssi: int,
     service_uuids: list[str],
     manufacturer_data: dict[int, bytes],
+    connectable: bool | None = None,
 ) -> BleDevice:
     """Convert raw advertisement fields into an assessed :class:`BleDevice`.
 
@@ -64,8 +66,10 @@ def build_ble_device(
     resolved from the *first* company identifier in ``manufacturer_data`` (its
     16-bit key); that identifier is also recorded in ``appearance`` as a
     ``0xNNNN`` token so the raw manufacturer id survives even when the vendor is
-    unknown. ``issues`` is populated by :func:`assess_ble_device`. Inputs are
-    coerced defensively so a malformed advertisement can never raise.
+    unknown. ``connectable`` stays ``None`` unless the backend reports it, so an
+    unknown value is never assessed as connectable. ``issues`` is populated by
+    :func:`assess_ble_device`. Inputs are coerced defensively so a malformed
+    advertisement can never raise.
     """
     company_id = next(iter(manufacturer_data), None)
     if isinstance(company_id, int):
@@ -82,11 +86,12 @@ def build_ble_device(
 
     device = BleDevice(
         address=str(address),
-        name=str(name) if name else "",
+        name=sanitize_name(name) if name else "",
         rssi=rssi_value,
         vendor=vendor,
         services=[str(uuid) for uuid in (service_uuids or [])],
         appearance=appearance,
+        connectable=connectable if isinstance(connectable, bool) else None,
     )
     device.issues = assess_ble_device(device)
     return device
@@ -133,6 +138,7 @@ async def scan_ble(duration: float = 10.0, adapter: str | None = None) -> list[B
             rssi=getattr(adv, "rssi", 0),
             service_uuids=list(getattr(adv, "service_uuids", None) or []),
             manufacturer_data=dict(getattr(adv, "manufacturer_data", None) or {}),
+            connectable=getattr(adv, "connectable", None),
         )
         devices.append(device)
 

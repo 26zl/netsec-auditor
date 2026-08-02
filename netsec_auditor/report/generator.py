@@ -114,6 +114,7 @@ class ReportGenerator:
         identified_services: list[Any] | None = None,
         wireless: Any | None = None,
         cve_priorities: list[dict[str, Any]] | None = None,
+        redact_wireless: bool = False,
     ) -> AuditReport:
         """Build a comprehensive audit report from scan and recon results."""
         now = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -205,8 +206,13 @@ class ReportGenerator:
             report.devices = [s.to_dict() for s in identified_services]
 
         if wireless is not None:
-            report.access_points = [ap.to_dict() for ap in wireless.aps()]
-            report.ble_devices = [d.to_dict() for d in wireless.ble()]
+            access_points = [ap.to_dict() for ap in wireless.aps()]
+            ble_devices = [d.to_dict() for d in wireless.ble()]
+            if redact_wireless:
+                access_points = [self._redact_wireless(a) for a in access_points]
+                ble_devices = [self._redact_wireless(d) for d in ble_devices]
+            report.access_points = access_points
+            report.ble_devices = ble_devices
 
         if cve_priorities:
             report.cve_priorities = cve_priorities
@@ -289,6 +295,7 @@ class ReportGenerator:
         wireless: Any | None = None,
         cve_priorities: list[dict[str, Any]] | None = None,
         formats: set[str] | None = None,
+        redact_wireless: bool = False,
     ) -> dict[str, Path]:
         """Generate all report formats."""
         selected = formats if formats is not None else {"json", "html", "pdf"}
@@ -300,6 +307,7 @@ class ReportGenerator:
             identified_services=identified_services,
             wireless=wireless,
             cve_priorities=cve_priorities,
+            redact_wireless=redact_wireless,
         )
 
         paths: dict[str, Path] = {}
@@ -325,7 +333,8 @@ class ReportGenerator:
 
     @staticmethod
     def _filename_timestamp() -> str:
-        return datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        """UTC, matching the report's ``generated_at`` field."""
+        return datetime.now(UTC).strftime("%Y%m%d-%H%M%S-%f")
 
     @staticmethod
     def _private_fd(path: Path) -> int:
@@ -411,6 +420,38 @@ class ReportGenerator:
         if report.summary.medium > 0 or report.summary.low > 3:
             return "LOW"
         return "INFORMATIONAL"
+
+    @staticmethod
+    def _mask_mac(value: str) -> str:
+        """Keep only the vendor OUI of a MAC, so the device is not re-identifiable."""
+        parts = value.split(":")
+        if len(parts) != 6:
+            return "[REDACTED]"
+        return ":".join(parts[:3] + ["xx"] * 3)
+
+    @classmethod
+    def _redact_wireless(cls, entry: dict[str, Any]) -> dict[str, Any]:
+        """Strip third-party identifiers from a wireless record.
+
+        A wardrive or Wi-Fi capture catalogs bystanders' networks and devices, so
+        reports keep the vendor OUI and a coarse location rather than the exact
+        hardware address and coordinates.
+        """
+        redacted = dict(entry)
+        for key in ("bssid", "address"):
+            value = redacted.get(key)
+            if isinstance(value, str) and value:
+                redacted[key] = cls._mask_mac(value)
+        clients = redacted.get("clients")
+        if isinstance(clients, list):
+            redacted["clients"] = [
+                cls._mask_mac(c) for c in clients if isinstance(c, str)
+            ]
+        for key in ("latitude", "longitude"):
+            value = redacted.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                redacted[key] = round(float(value), 2)  # ~1 km
+        return redacted
 
     @staticmethod
     def _finding_to_dict(finding: dict[str, Any]) -> dict[str, Any]:

@@ -77,12 +77,30 @@ def test_build_ble_device_without_manufacturer_data() -> None:
 
 
 def test_build_ble_device_no_services_connectable_is_flagged() -> None:
-    # A connectable device advertising no services should be flagged by the
-    # assessment that build_ble_device runs.
-    device = build_ble_device("AA:BB:CC:DD:EE:FF", "", -60, [], {})
+    # Only a device the backend reports as connectable is flagged for
+    # advertising no services.
+    device = build_ble_device("AA:BB:CC:DD:EE:FF", "", -60, [], {}, connectable=True)
     assert device.connectable is True
     assert device.issues
     assert any(_NO_SERVICES in issue for issue in device.issues)
+
+
+def test_build_ble_device_connectable_unknown_is_not_flagged() -> None:
+    # Most backends never report connectability; it must stay unknown rather
+    # than defaulting to True and fabricating a finding for every advertiser.
+    device = build_ble_device("AA:BB:CC:DD:EE:FF", "", -60, [], {})
+    assert device.connectable is None
+    assert all(_NO_SERVICES not in issue for issue in device.issues)
+
+
+def test_build_ble_device_non_bool_connectable_is_unknown() -> None:
+    device = build_ble_device("AA:BB:CC:DD:EE:FF", "", -60, [], {}, connectable="yes")  # type: ignore[arg-type]
+    assert device.connectable is None
+
+
+def test_build_ble_device_sanitizes_name() -> None:
+    device = build_ble_device("AA:BB:CC:DD:EE:FF", "Tag\x1b[31m\x07\n", -60, ["svc"], {})
+    assert device.name == "Tag[31m"
 
 
 def test_build_ble_device_with_services_not_flagged_for_services() -> None:
@@ -248,8 +266,22 @@ async def test_scan_ble_falls_back_to_device_name_and_zero_rssi(
     assert len(result) == 1
     assert result[0].name == "Fallback"
     assert result[0].rssi == 0
-    # Connectable (default) with no services → flagged.
-    assert any(_NO_SERVICES in issue for issue in result[0].issues)
+    # bleak reports no connectability here, so the finding must not fire.
+    assert result[0].connectable is None
+    assert all(_NO_SERVICES not in issue for issue in result[0].issues)
+
+
+async def test_scan_ble_uses_advertised_connectable_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adv = _FakeAdv(local_name="Lock", rssi=-50, service_uuids=[], manufacturer_data={})
+    adv.connectable = True
+    _install_fake_bleak(monkeypatch, discovered={"11:22:33:44:55:77": (_FakeDev(None), adv)})
+
+    device = (await scan_ble(duration=0.1))[0]
+
+    assert device.connectable is True
+    assert any(_NO_SERVICES in issue for issue in device.issues)
 
 
 async def test_scan_ble_forwards_adapter_and_flags(

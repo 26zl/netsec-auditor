@@ -174,6 +174,56 @@ def test_parse_wigle_csv_tolerates_malformed() -> None:
     assert ap.longitude is None
 
 
+def test_parse_wigle_csv_owe_is_not_reported_as_open() -> None:
+    text = (
+        "WigleWifi-1.6\n"
+        "MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,"
+        "CurrentLongitude,AltitudeMeters,AccuracyMeters,Type\n"
+        "00:00:00:00:00:21,EnhancedOpen,[RSN-OWE-CCMP][ESS],t,6,-50,1,2,0,0,WIFI\n"
+    )
+    ap = parse_wigle_csv(text)[0]
+    assert ap.encryption == "owe"
+    assert ap.auth == "OWE"
+    assert all("Open network" not in issue for issue in ap.issues)
+
+
+def test_parse_wigle_csv_owe_needs_a_whole_token() -> None:
+    # "TOWER" must not be mistaken for Enhanced Open.
+    text = (
+        "WigleWifi-1.6\n"
+        "MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,"
+        "CurrentLongitude,AltitudeMeters,AccuracyMeters,Type\n"
+        "00:00:00:00:00:22,TowerNet,[TOWER-GUEST],t,6,-50,1,2,0,0,WIFI\n"
+    )
+    ap = parse_wigle_csv(text)[0]
+    assert ap.encryption == "open"
+    assert any("Open network" in issue for issue in ap.issues)
+
+
+def test_parse_wigle_csv_drops_out_of_range_coordinates() -> None:
+    # An unquoted comma in an SSID shifts the row, so coordinates land in the
+    # wrong columns; impossible values must be dropped rather than reported.
+    text = (
+        "WigleWifi-1.6\n"
+        "MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,"
+        "CurrentLongitude,AltitudeMeters,AccuracyMeters,Type\n"
+        "00:00:00:00:00:23,Shifted,[OPEN],t,6,-50,999.0,-200.5,0,0,WIFI\n"
+    )
+    ap = parse_wigle_csv(text)[0]
+    assert ap.latitude is None
+    assert ap.longitude is None
+
+
+def test_parse_wigle_csv_sanitizes_ssid() -> None:
+    text = (
+        "WigleWifi-1.6\n"
+        "MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,"
+        "CurrentLongitude,AltitudeMeters,AccuracyMeters,Type\n"
+        "00:00:00:00:00:24,Evil\x1b[31mAP,[OPEN],t,6,-50,1,2,0,0,WIFI\n"
+    )
+    assert parse_wigle_csv(text)[0].ssid == "Evil[31mAP"
+
+
 def test_parse_wigle_csv_garbage_returns_empty() -> None:
     assert parse_wigle_csv("") == []
     assert parse_wigle_csv("just some text\nwith no header") == []
@@ -203,6 +253,20 @@ def test_parse_gpx_two_waypoints() -> None:
     assert named.ssid == "NamedOnly"
     assert named.encryption == "open"
     assert any("Open network" in issue for issue in named.issues)
+
+
+def test_parse_gpx_drops_out_of_range_coordinates() -> None:
+    text = (
+        '<gpx version="1.1">\n'
+        '  <wpt lat="91.5" lon="10.76">\n'
+        "    <name>BadLat</name>\n"
+        "    <desc>BSSID=00:11:22:33:44:56 AuthMode=WPA2-PSK-CCMP</desc>\n"
+        "  </wpt>\n"
+        "</gpx>\n"
+    )
+    ap = parse_gpx(text)[0]
+    assert ap.latitude is None
+    assert ap.longitude == 10.76
 
 
 def test_parse_gpx_garbage_returns_empty() -> None:

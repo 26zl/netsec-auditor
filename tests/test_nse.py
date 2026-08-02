@@ -70,7 +70,7 @@ def test_build_nmap_command_with_ports() -> None:
     cmd = build_nmap_command("10.0.0.5", TLS_SCRIPTS, ports="443")
     assert cmd == [
         "nmap", "-Pn", "--script", "ssl-enum-ciphers,ssl-cert",
-        "-p", "443", "-oX", "-", "10.0.0.5",
+        "-p", "443", "-oX", "-", "--", "10.0.0.5",
     ]
 
 
@@ -78,8 +78,21 @@ def test_build_nmap_command_without_ports_and_extra_args() -> None:
     cmd = build_nmap_command("host", SNMP_SCRIPTS, extra_args=["-T2"])
     assert cmd == [
         "nmap", "-Pn", "--script", "snmp-info,snmp-sysdescr",
-        "-T2", "-oX", "-", "host",
+        "-T2", "-oX", "-", "--", "host",
     ]
+
+
+def test_build_nmap_command_terminates_options_before_target() -> None:
+    # Without "--" nmap would read a dash-prefixed target as a flag.
+    cmd = build_nmap_command("-oN/tmp/pwned", SNMP_SCRIPTS)
+    assert cmd[-2:] == ["--", "-oN/tmp/pwned"]
+
+
+def test_build_nmap_command_rejects_non_pacing_extra_args() -> None:
+    cmd = build_nmap_command("host", SNMP_SCRIPTS, extra_args=["--script", "evil.nse", "-T3"])
+    assert "--script" not in cmd[4:]
+    assert "evil.nse" not in cmd
+    assert "-T3" in cmd
 
 
 def test_parse_extracts_host_port_script_output() -> None:

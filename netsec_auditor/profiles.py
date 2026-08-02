@@ -90,8 +90,18 @@ PROFILES: dict[str, Profile] = {p.name: p for p in (IT, IOT, OT)}
 
 
 def get_profile(name: str) -> Profile:
-    """Return a profile by name, defaulting to IT for unknown names."""
-    return PROFILES.get(name.lower(), IT)
+    """Return a profile by name.
+
+    Raises on an unknown name rather than defaulting: silently falling back to the
+    most permissive profile would run an aggressive scan against a network the
+    operator had asked to treat as fragile.
+    """
+    try:
+        return PROFILES[name.lower()]
+    except KeyError:
+        raise ValueError(
+            f"unknown profile {name!r}; expected one of: {', '.join(sorted(PROFILES))}"
+        ) from None
 
 
 def classify_ports(ports: set[int]) -> str:

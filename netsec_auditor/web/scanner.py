@@ -239,7 +239,7 @@ class WebScanner:
 
     async def scan(self, url: str, deep: bool = False) -> WebScanResult:
         """Perform a comprehensive web security scan."""
-        parsed, _pin_ip = self._validate_url(url)
+        parsed, pin_ip = self._validate_url(url)
         self._client.cookies.clear()
         start = time.monotonic()
 
@@ -251,9 +251,13 @@ class WebScanner:
         # that a modern HTTP client cannot GET.
         if parsed.scheme == "https" and parsed.hostname:
             tls_port = parsed.port or 443
-            result.ssl_certificate = await self._analyze_ssl(parsed.hostname, tls_port)
+            result.ssl_certificate = await self._analyze_ssl(
+                parsed.hostname, tls_port, connect_host=pin_ip
+            )
             result.vulnerabilities.extend(
-                await self._check_tls_posture(parsed.hostname, tls_port, result.url)
+                await self._check_tls_posture(
+                    parsed.hostname, tls_port, result.url, connect_host=pin_ip
+                )
             )
 
         response = await self._safe_request("GET", base_url)
@@ -621,10 +625,10 @@ class WebScanner:
         vulns: list[WebVulnerability] = []
 
         for cookie_str in response.set_cookie_headers:
-            cookie_lower = cookie_str.lower()
+            attributes = self._cookie_attributes(cookie_str)
             evidence = self._redact_set_cookie(cookie_str)
 
-            if "httponly" not in cookie_lower:
+            if "httponly" not in attributes:
                 vulns.append(
                     WebVulnerability(
                         id=f"COOKIE-NO-HTTPONLY-{short_id(cookie_str)}",
@@ -642,7 +646,7 @@ class WebScanner:
                     )
                 )
 
-            if "secure" not in cookie_lower:
+            if "secure" not in attributes:
                 vulns.append(
                     WebVulnerability(
                         id=f"COOKIE-NO-SECURE-{short_id(cookie_str)}",
@@ -657,7 +661,7 @@ class WebScanner:
                     )
                 )
 
-            if "samesite" not in cookie_lower:
+            if "samesite" not in attributes:
                 vulns.append(
                     WebVulnerability(
                         id=f"COOKIE-NO-SAMESITE-{short_id(cookie_str)}",
@@ -675,6 +679,20 @@ class WebScanner:
         return vulns
 
     @staticmethod
+    def _cookie_attributes(cookie: str) -> set[str]:
+        """Attribute names of a Set-Cookie header, excluding the leading name=value.
+
+        Matching attributes rather than the raw header keeps a cookie *named*
+        ``__Secure-SID`` from being read as carrying the ``Secure`` attribute.
+        """
+        _name_value, _, attributes = cookie.partition(";")
+        return {
+            attribute.partition("=")[0].strip().lower()
+            for attribute in attributes.split(";")
+            if attribute.strip()
+        }
+
+    @staticmethod
     def _redact_set_cookie(cookie: str) -> str:
         """Keep cookie attributes while removing its value."""
         first, separator, attributes = cookie.partition(";")
@@ -683,12 +701,12 @@ class WebScanner:
         return f"{name}=[REDACTED]{suffix}"[:200]
 
     async def _check_tls_posture(
-        self, hostname: str, port: int, url: str
+        self, hostname: str, port: int, url: str, connect_host: str | None = None
     ) -> list[WebVulnerability]:
         """Scan TLS protocol versions and ciphers; map findings to vulnerabilities."""
         from netsec_auditor.web.tls import scan_tls
 
-        result = await scan_tls(hostname, port, self.timeout)
+        result = await scan_tls(hostname, port, self.timeout, connect_host=connect_host)
         vulns: list[WebVulnerability] = []
         for finding in result.get("findings", []):
             digest = short_id(finding["name"] + url)
@@ -707,7 +725,7 @@ class WebScanner:
         return vulns
 
     async def _analyze_ssl(
-        self, hostname: str, port: int = 443
+        self, hostname: str, port: int = 443, connect_host: str | None = None
     ) -> SSLCertificate | None:
         """Analyze the TLS certificate.
 
@@ -715,25 +733,34 @@ class WebScanner:
         directly, so expired / self-signed / hostname-mismatch certs are reported
         rather than silently dropped. Chain trust is checked separately.
         """
-        cert_bin = await self._fetch_cert_der(hostname, port)
+        cert_bin = await self._fetch_cert_der(hostname, port, connect_host)
         if cert_bin is None:
             return None
 
         cert = self._parse_certificate(cert_bin, hostname)
 
-        trusted, reason = await self._verify_trust(hostname, port)
+        trusted, reason = await self._verify_trust(hostname, port, connect_host)
         if not trusted and reason:
             cert.issues.append(f"Certificate chain not trusted: {reason}")
         return cert
 
-    async def _fetch_cert_der(self, hostname: str, port: int) -> bytes | None:
-        """Retrieve the peer certificate (DER) without requiring it to validate."""
+    async def _fetch_cert_der(
+        self, hostname: str, port: int, connect_host: str | None = None
+    ) -> bytes | None:
+        """Retrieve the peer certificate (DER) without requiring it to validate.
+
+        ``connect_host`` is the scope-validated address to dial; SNI still carries
+        the hostname, so the scope check cannot be bypassed by a second DNS answer.
+        """
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
         try:
             reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(hostname, port, ssl=ctx), timeout=self.timeout
+                asyncio.open_connection(
+                    connect_host or hostname, port, ssl=ctx, server_hostname=hostname
+                ),
+                timeout=self.timeout,
             )
             cert_bin = writer.get_extra_info("ssl_object").getpeercert(binary_form=True)
             writer.close()
@@ -743,12 +770,17 @@ class WebScanner:
             logger.debug("ssl_fetch_failed", hostname=hostname, error=str(e))
             return None
 
-    async def _verify_trust(self, hostname: str, port: int) -> tuple[bool, str]:
+    async def _verify_trust(
+        self, hostname: str, port: int, connect_host: str | None = None
+    ) -> tuple[bool, str]:
         """Check whether the chain and hostname validate against the system trust store."""
         ctx = ssl.create_default_context()
         try:
             reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(hostname, port, ssl=ctx), timeout=self.timeout
+                asyncio.open_connection(
+                    connect_host or hostname, port, ssl=ctx, server_hostname=hostname
+                ),
+                timeout=self.timeout,
             )
             writer.close()
             await writer.wait_closed()
@@ -867,8 +899,8 @@ class WebScanner:
                         "value": "[REDACTED]" if value else "",
                     })
                 forms.append(form_info)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("form_discovery_failed", error=str(exc))
         return forms
 
     async def _crawl(self, base_url: str, response: HTTPResponse) -> list[str]:
@@ -890,8 +922,8 @@ class WebScanner:
 
                 if full_parsed.netloc == parsed_base.netloc:
                     urls.add(self._redact_url(full_url))
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("crawl_failed", error=str(exc))
 
         return sorted(urls)[:200]
 

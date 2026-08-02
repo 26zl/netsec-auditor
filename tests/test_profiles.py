@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from netsec_auditor.profiles import (
     IOT,
     IT,
@@ -19,10 +21,17 @@ def test_classify_ports() -> None:
     assert classify_ports({502, 1883}) == "ot"    # OT beats IoT
 
 
-def test_get_profile_defaults_to_it() -> None:
+def test_get_profile_resolves_known_names() -> None:
     assert get_profile("ot") is OT
     assert get_profile("iot") is IOT
-    assert get_profile("bogus") is IT
+    assert get_profile("it") is IT
+
+
+def test_get_profile_rejects_unknown_name() -> None:
+    # Failing open to IT would run an aggressive scan against a network the
+    # operator asked to treat as fragile.
+    with pytest.raises(ValueError, match="unknown profile"):
+        get_profile("ot-safe")
 
 
 def test_ot_interlock_downgrades() -> None:

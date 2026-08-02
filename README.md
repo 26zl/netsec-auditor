@@ -96,9 +96,8 @@ external monitor-mode adapter is only needed for frame-level passive capture
 
 ## Installation
 
-The repository is currently private and version 1.0.0 has not yet been published
-to PyPI or GHCR. The source install below is therefore the currently available
-installation path (repository access is required).
+Version 1.0.0 has not yet been published to PyPI or GHCR, so the source install
+below is currently the only installation path.
 
 ```bash
 # From source
@@ -133,6 +132,9 @@ netsec-auditor discover 192.168.1.0/24 --method both
 # Vulnerability assessment, optionally enriched with NVD CVE data
 # Export NVD_API_KEY in the environment first; avoid placing secrets in shell history.
 netsec-auditor vuln 10.0.0.5 --cve-check
+# --nse runs the curated SMB/SNMP/TLS scripts; --nse-ics adds the ICS/OT scripts,
+# which nmap classes as intrusive because they send protocol requests to PLCs.
+netsec-auditor vuln 10.0.0.5 --nse --nse-ics
 
 # Device web-interface audit (router / camera / NAS / PLC / HMI admin panels)
 netsec-auditor web https://192.168.1.1 --deep
@@ -161,6 +163,7 @@ netsec-auditor ble --duration 10
 
 # Import wardriving data from your ESP32/Flipper/Kismet gadgets
 netsec-auditor wardrive capture.wigle.csv --output ./reports
+netsec-auditor wardrive capture.wigle.csv --ssid ACME- --no-redact  # narrow + full detail
 
 # Walk-around audit — discover + scan + OT/IoT/SNMP + Wi-Fi/BLE → one report
 sudo netsec-auditor walk 192.168.1.0/24 --wifi --ble --output ./reports
@@ -192,8 +195,10 @@ site and audit as they go:
 - **Gadget integration** — imports **WiGLE CSV (1.4/1.6), GPX and Kismet** exports
   from the ESP32/Flipper tools in the companion
   [gadgets-tools](https://github.com/26zl/gadgets-tools) project.
-- **Read-only / passive only** — it receives and catalogs; it never transmits
-  deauth/attack frames or cracks handshakes.
+- **Read-only** — it receives and catalogs; it never transmits deauth/attack
+  frames or cracks handshakes. Monitor-mode capture is fully passive; the
+  `nmcli`/`iw`/`system_profiler` fallback and BLE scanning delegate to the OS,
+  which performs a normal active scan (probe requests / SCAN_REQ).
 
 ### Install on Kali NetHunter (e.g. Galaxy S10)
 
@@ -212,6 +217,18 @@ netsec-auditor doctor                    # confirm what's available
   `BLEAK_DBUS_AUTH_UID=<host-uid>` so bleak can reach the host D-Bus.
 - Verify wheel and native-library availability on the specific aarch64/NetHunter
   image before deployment.
+
+## Third-party data
+
+Wi-Fi and wardrive captures record every network in range, most belonging to
+people who are not the audit subject. Reports therefore **redact by default**:
+BSSIDs and client MACs are truncated to their vendor OUI and GPS coordinates are
+rounded to ~1 km. Use `--no-redact` when the engagement covers the full detail,
+and `--ssid` on `wardrive` to import only the networks in question.
+
+`enrich <ip>` sends the address to Shodan InternetDB — a third party. Non-global
+addresses are never sent; public ones leave your network, so check that this is
+acceptable under the engagement's confidentiality terms.
 
 ## Scope files
 

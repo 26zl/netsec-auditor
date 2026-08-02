@@ -35,6 +35,14 @@ mypy netsec_auditor       # strict type check; currently reports known debt
 test for any behavior change, especially in the scanning, scope, or reporting
 paths.
 
+Write tests against the intended behavior, not against what the code currently
+does — several defects have survived because a test asserted them.
+
+CI also builds the Docker image, audits dependencies with `pip-audit`, and
+verifies `uv.lock` still resolves. The lockfile is for reproducible CI and local
+development only; the published wheel keeps the version ranges in
+`pyproject.toml`. Refresh it with `uv lock` when you change a dependency.
+
 ## Pull requests
 
 - Keep the diff focused: one logical change per PR.

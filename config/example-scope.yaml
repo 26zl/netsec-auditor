@@ -11,6 +11,8 @@ ip_addresses:
   - "203.0.113.11"
 excluded_cidr_ranges:
   - "10.0.0.0/28"
+# Exclusions cover the name and everything beneath it: "prod.example.com" also
+# excludes "db.prod.example.com".
 excluded_domains:
   - "prod.example.com"
 excluded_ip_addresses:

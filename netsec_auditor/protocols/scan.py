@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Iterable
 
 from netsec_auditor.profiles import Profile
 from netsec_auditor.protocols import probers_for_port
@@ -19,25 +20,36 @@ async def identify_services(
     profile: Profile,
     timeout: float = 5.0,
     rate_per_second: float = 0.0,
+    udp_ports: Iterable[int] | None = None,
 ) -> list[ProbeResult]:
     """Probe each open port that has a registered prober, honouring the profile.
 
     The OT profile forces sequential, delayed probing (max_concurrency=1,
     scan_delay set) so fragile devices are not overwhelmed. Intrusive probers are
     skipped unless the profile explicitly allows them.
+
+    Passing ``udp_ports`` makes ``ports`` TCP-only, so a host that only has a TCP
+    port open is not sent the UDP datagram of a same-port sibling spec. When it is
+    omitted every transport registered on a port is probed, as before.
     """
-    specs: list[ProbeSpec] = [
-        spec
-        for port in ports
-        for spec in probers_for_port(port)
-        if spec.is_safe or profile.allow_intrusive
-    ]
-    if not specs:
-        return []
     if timeout <= 0:
         raise ValueError("timeout must be greater than zero")
     if rate_per_second < 0:
         raise ValueError("rate_per_second cannot be negative")
+
+    if udp_ports is None:
+        candidates: list[tuple[int, str | None]] = [(port, None) for port in ports]
+    else:
+        candidates = [(port, "tcp") for port in ports]
+        candidates += [(port, "udp") for port in udp_ports]
+    specs: list[ProbeSpec] = [
+        spec
+        for port, transport in candidates
+        for spec in probers_for_port(port, transport)
+        if spec.is_safe or profile.allow_intrusive
+    ]
+    if not specs:
+        return []
 
     semaphore = asyncio.Semaphore(max(1, profile.max_concurrency))
     rate_lock = asyncio.Lock()

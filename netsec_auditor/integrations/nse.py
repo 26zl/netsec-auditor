@@ -9,9 +9,11 @@ It is strictly optional: :func:`nse_available` reports whether nmap is on
 Design notes:
 
 * The only external process invoked is ``nmap`` with ``-oX -`` (XML to stdout).
-* All curated scripts are officially categorized ``safe``/``default``/``discovery``
-  — including ``smb-vuln-ms17-010``, which is a *safe detection* script (no
-  exploitation). Nothing here performs brute-force, DoS, or intrusive actions.
+* No script here performs brute-force, DoS, or exploitation; ``smb-vuln-ms17-010``
+  is categorized ``safe`` and only detects. Note that ``modbus-discover`` and
+  ``ssl-enum-ciphers`` carry nmap's ``intrusive`` category, and the ICS scripts are
+  ``discovery``/``version`` rather than ``safe`` — the ICS set sends protocol
+  requests to PLCs and should be run only when that is acceptable.
 * :func:`parse_nmap_xml` and :func:`summarize_findings` are pure and unit-testable
   without a network or the nmap binary; they are the testable core.
 """
@@ -20,8 +22,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import re
 import shutil
 import xml.etree.ElementTree as ET
+
+from defusedxml.ElementTree import DefusedXMLParser
 
 from netsec_auditor.utils.logging import get_logger
 
@@ -43,7 +48,6 @@ ICS_SCRIPTS = [
     "bacnet-info",
     "enip-info",
     "omron-info",
-    "dnp3-info",
 ]
 DISCOVERY_SCRIPTS = ["banner", "http-title"]
 
@@ -77,6 +81,13 @@ _REMEDIATION: dict[str, str] = {
 _DEFAULT_REMEDIATION = "Review the NSE output and remediate per vendor guidance."
 
 
+# Callers may only soften pacing; anything else (notably --script) would void the
+# read-only guarantee the curated script sets provide.
+_PACING_ARG_RE = re.compile(
+    r"-T[0-5]|--host-timeout=\S+|--max-retries=\d+|--scan-delay=\S+|--min-rate=\d+"
+)
+
+
 def nse_available() -> bool:
     """Return True if the ``nmap`` binary is on ``PATH``."""
     return shutil.which("nmap") is not None
@@ -92,9 +103,13 @@ def build_nmap_command(
     cmd = ["nmap", "-Pn", "--script", ",".join(scripts)]
     if ports:
         cmd += ["-p", ports]
-    if extra_args:
-        cmd += list(extra_args)
-    cmd += ["-oX", "-", target]
+    for arg in extra_args or []:
+        if _PACING_ARG_RE.fullmatch(arg):
+            cmd.append(arg)
+        else:
+            logger.warning("nse_extra_arg_rejected", arg=arg)
+    # "--" stops option parsing so a target beginning with "-" cannot become a flag.
+    cmd += ["-oX", "-", "--", target]
     return cmd
 
 
@@ -103,16 +118,24 @@ async def _run_nmap(cmd: list[str], timeout: float) -> str:
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
     )
     try:
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except TimeoutError:
         with contextlib.suppress(ProcessLookupError):
             proc.kill()
         with contextlib.suppress(Exception):  # reap the killed child
             await proc.wait()
-        logger.debug("nse_timeout", timeout=timeout)
+        logger.warning("nse_timeout", timeout=timeout)
+        return ""
+    # A bad script name makes nmap abort before scanning; without this the caller
+    # cannot tell "nothing found" from "never ran".
+    if proc.returncode != 0:
+        detail = stderr.decode("utf-8", "replace").strip().splitlines()
+        logger.warning(
+            "nse_failed", returncode=proc.returncode, error=detail[-1] if detail else "",
+        )
         return ""
     return stdout.decode("utf-8", "replace")
 
@@ -208,7 +231,12 @@ def parse_nmap_xml(xml_text: str) -> list[dict]:
         return findings
     # A pull parser lets us keep complete <host> subtrees even if the tail is
     # truncated — ParseError is swallowed so we never raise on bad input.
-    parser = ET.XMLPullParser(["end"])
+    # nmap emits a plain <!DOCTYPE nmaprun>, so the DTD itself is allowed; entity
+    # definitions are not, which blocks billion-laughs / XXE in a saved XML file.
+    parser = ET.XMLPullParser(
+        ["end"],
+        _parser=DefusedXMLParser(forbid_dtd=False, forbid_entities=True, forbid_external=True),
+    )
     with contextlib.suppress(ET.ParseError):
         parser.feed(xml_text)
     with contextlib.suppress(ET.ParseError):

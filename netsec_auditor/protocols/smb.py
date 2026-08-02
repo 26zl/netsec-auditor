@@ -15,6 +15,7 @@ live host; ``probe_smb`` performs the I/O and never raises.
 
 from __future__ import annotations
 
+import secrets
 import struct
 
 from netsec_auditor.protocols.base import ProbeResult, ProbeSpec, tcp_request
@@ -61,6 +62,13 @@ def _netbios_session(payload: bytes) -> bytes:
     return bytes([0x00]) + len(payload).to_bytes(3, "big") + payload
 
 
+def netbios_frame_length(data: bytes) -> int | None:
+    """Total NetBIOS session frame size: 4-byte header + its 24-bit length field."""
+    if len(data) < 4:
+        return None
+    return 4 + int.from_bytes(data[1:4], "big")
+
+
 def _smb2_header(command: int, message_id: int = 0) -> bytes:
     """Build the fixed 64-byte SMB2 synchronous request header."""
     return struct.pack(
@@ -90,7 +98,9 @@ def _smb2_context(ctx_type: int, data: bytes) -> bytes:
 def _smb2_negotiate_contexts() -> tuple[bytes, int]:
     """Return (context list bytes, context count) required to offer SMB 3.1.1."""
     # Preauth integrity (mandatory for 3.1.1): 1 hash algorithm = SHA-512, 32-byte salt.
-    preauth = struct.pack("<HHH", 1, 32, 0x0001) + b"\x00" * 32
+    # The salt is random rather than constant so the probe leaves no static wire
+    # fingerprint; no session is established, so its value is never used.
+    preauth = struct.pack("<HHH", 1, 32, 0x0001) + secrets.token_bytes(32)
     # Encryption capabilities: offer AES-128-CCM (0x0001) and AES-128-GCM (0x0002).
     encryption = struct.pack("<HHH", 2, 0x0001, 0x0002)
     ctx1 = _smb2_context(0x0001, preauth)  # SMB2_PREAUTH_INTEGRITY_CAPABILITIES
@@ -182,8 +192,13 @@ def _parse_smb2_negotiate(data: bytes) -> dict[str, str]:
 
 
 def _parse_smb1_negotiate(data: bytes) -> dict[str, str]:
-    """Note SMBv1 support and, when present, the SMB1 signing flags."""
-    info: dict[str, str] = {"smbv1_supported": "true"}
+    """Note SMBv1 support and, when present, the SMB1 signing flags.
+
+    A host with SMB1 disabled still answers with an ``\\xffSMB`` header, so support
+    is only claimed once the server actually negotiated a dialect — otherwise the
+    EternalBlue precondition would fire on a hardened host.
+    """
+    info: dict[str, str] = {}
     if len(data) < 33:  # 32-byte header + WordCount byte
         return info
     word_count = data[32]
@@ -193,6 +208,7 @@ def _parse_smb1_negotiate(data: bytes) -> dict[str, str]:
         dialect_index = struct.unpack_from("<H", words, 0)[0]
         security_mode = words[2]
         if dialect_index != 0xFFFF and dialect_index < len(_SMB1_DIALECTS):
+            info["smbv1_supported"] = "true"
             info["dialect"] = _SMB1_DIALECTS[dialect_index]
         else:
             info["dialect"] = "none"  # server accepted none of the offered dialects
@@ -219,7 +235,9 @@ def parse_smb_negotiate_response(data: bytes) -> dict[str, str]:
 async def _negotiate(host: str, port: int, payload: bytes, timeout: float) -> dict[str, str]:
     """Send one negotiate and parse the reply; returns {} on any failure (never raises)."""
     try:
-        reply = await tcp_request(host, port, payload, timeout)
+        reply = await tcp_request(
+            host, port, payload, timeout, frame_length=netbios_frame_length
+        )
     except Exception:
         return {}
     if not reply:

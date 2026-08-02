@@ -14,6 +14,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
 Prober = Callable[[str, int, float], Awaitable["ProbeResult | None"]]
+# Maps the bytes received so far to the full frame size, or None while undetermined.
+FrameLength = Callable[[bytes], "int | None"]
 
 
 @dataclass
@@ -52,19 +54,26 @@ class ProbeSpec:
     is_safe: bool = True  # read-only identification only
 
 
-_REGISTRY: dict[int, list[ProbeSpec]] = {}
+_REGISTRY: dict[tuple[int, str], list[ProbeSpec]] = {}
 _SPECS: list[ProbeSpec] = []
 
 
 def register(specs: list[ProbeSpec]) -> None:
-    """Register a module's probe specs into the port-indexed registry."""
+    """Register a module's probe specs into the (port, transport)-indexed registry."""
     for spec in specs:
         _SPECS.append(spec)
-        _REGISTRY.setdefault(spec.default_port, []).append(spec)
+        _REGISTRY.setdefault((spec.default_port, spec.transport), []).append(spec)
 
 
-def probers_for_port(port: int) -> list[ProbeSpec]:
-    return _REGISTRY.get(port, [])
+def probers_for_port(port: int, transport: str | None = None) -> list[ProbeSpec]:
+    """Specs bound to ``port``; ``transport`` None matches both TCP and UDP.
+
+    Keying on the transport keeps a TCP-only open port (e.g. 44818) from also
+    receiving the UDP datagram of its same-port sibling spec.
+    """
+    if transport is not None:
+        return _REGISTRY.get((port, transport), [])
+    return [s for t in ("tcp", "udp") for s in _REGISTRY.get((port, t), [])]
 
 
 def all_specs() -> list[ProbeSpec]:
@@ -75,10 +84,48 @@ def ot_ports() -> set[int]:
     return {s.default_port for s in _SPECS if s.is_ot}
 
 
+async def read_framed(
+    reader: asyncio.StreamReader,
+    timeout: float,
+    frame_length: FrameLength | None = None,
+    recv_size: int = 4096,
+) -> bytes:
+    """Read until ``frame_length`` is satisfied, EOF, or ``timeout`` expires.
+
+    A single ``StreamReader.read`` returns as soon as any bytes arrive, so a
+    segmented reply would otherwise be handed to the parsers as a truncated PDU.
+    Whatever arrived before the timeout is still returned; parsers reject a short
+    frame themselves.
+    """
+    buf = bytearray()
+    with contextlib.suppress(TimeoutError):
+        async with asyncio.timeout(timeout):
+            while True:
+                chunk = await reader.read(recv_size)
+                if not chunk:
+                    break
+                buf += chunk
+                if frame_length is None:
+                    break
+                want = frame_length(bytes(buf))
+                if want is None or len(buf) >= want:
+                    break
+    return bytes(buf)
+
+
 async def tcp_request(
-    host: str, port: int, payload: bytes, timeout: float, recv_size: int = 4096
+    host: str,
+    port: int,
+    payload: bytes,
+    timeout: float,
+    recv_size: int = 4096,
+    frame_length: FrameLength | None = None,
 ) -> bytes | None:
-    """Send ``payload`` over TCP and return up to ``recv_size`` bytes, or None."""
+    """Send ``payload`` over TCP and return the reply, or None.
+
+    Without ``frame_length`` a single read is returned; with it, reads continue
+    until the protocol's own length prefix is satisfied.
+    """
     try:
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(host, port), timeout
@@ -89,7 +136,7 @@ async def tcp_request(
         if payload:
             writer.write(payload)
             await writer.drain()
-        return await asyncio.wait_for(reader.read(recv_size), timeout)
+        return await read_framed(reader, timeout, frame_length, recv_size)
     except (TimeoutError, ConnectionError, OSError):
         return None
     finally:
@@ -115,8 +162,9 @@ async def udp_request(
                 fut.set_exception(exc)
 
     try:
-        transport, _ = await loop.create_datagram_endpoint(
-            _Proto, remote_addr=(host, port)
+        # remote_addr triggers a getaddrinfo, so this must respect the timeout too.
+        transport, _ = await asyncio.wait_for(
+            loop.create_datagram_endpoint(_Proto, remote_addr=(host, port)), timeout
         )
     except (TimeoutError, OSError):
         return None

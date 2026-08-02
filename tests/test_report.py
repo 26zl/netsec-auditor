@@ -77,3 +77,41 @@ def test_missing_native_pdf_backend_degrades_cleanly(tmp_path, monkeypatch) -> N
     monkeypatch.setattr(builtins, "__import__", fail_weasyprint)
 
     assert generator.generate_pdf(report) is None
+
+
+def test_wireless_redaction_masks_third_party_identifiers() -> None:
+    entry = {
+        "bssid": "aa:bb:cc:dd:ee:ff",
+        "ssid": "CafeWiFi",
+        "clients": ["11:22:33:44:55:66"],
+        "latitude": 59.913868,
+        "longitude": 10.752245,
+    }
+    out = ReportGenerator._redact_wireless(entry)
+    assert out["bssid"] == "aa:bb:cc:xx:xx:xx"
+    assert out["clients"] == ["11:22:33:xx:xx:xx"]
+    assert out["latitude"] == 59.91
+    assert out["longitude"] == 10.75
+    assert out["ssid"] == "CafeWiFi"  # SSID is the audit subject, not an identifier
+
+
+def test_wireless_redaction_is_opt_in(tmp_path) -> None:
+    class _Inventory:
+        @staticmethod
+        def aps():
+            return [_Ap()]
+
+        @staticmethod
+        def ble():
+            return []
+
+    class _Ap:
+        @staticmethod
+        def to_dict():
+            return {"bssid": "aa:bb:cc:dd:ee:ff", "clients": [], "latitude": None}
+
+    gen = ReportGenerator(output_dir=tmp_path / "r")
+    plain = gen.build_report(wireless=_Inventory())
+    assert plain.access_points[0]["bssid"] == "aa:bb:cc:dd:ee:ff"
+    masked = gen.build_report(wireless=_Inventory(), redact_wireless=True)
+    assert masked.access_points[0]["bssid"] == "aa:bb:cc:xx:xx:xx"

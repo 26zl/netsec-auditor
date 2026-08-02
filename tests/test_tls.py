@@ -113,6 +113,8 @@ def test_scan_tls_is_async_and_importable() -> None:
     # Do not invoke it — that would touch the network. Just verify the contract.
     assert inspect.iscoroutinefunction(scan_tls)
     sig = inspect.signature(scan_tls)
-    assert list(sig.parameters) == ["hostname", "port", "timeout"]
+    assert list(sig.parameters) == ["hostname", "port", "timeout", "connect_host"]
     assert sig.parameters["port"].default == 443
     assert sig.parameters["timeout"].default == 10.0
+    # None means "dial the hostname"; callers pass a scope-validated IP to pin it.
+    assert sig.parameters["connect_host"].default is None

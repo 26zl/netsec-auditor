@@ -74,6 +74,40 @@ def test_cookie_findings_redact_cookie_value() -> None:
     assert all("session=[REDACTED]" in finding.evidence for finding in findings)
 
 
+def test_cookie_flags_are_matched_as_attributes_not_substrings() -> None:
+    scanner = WebScanner(Scope(name="t", ip_addresses=["127.0.0.1"]))
+    # Cookie names carrying the flag words must not mask the missing attributes.
+    response = HTTPResponse(
+        status_code=200,
+        headers={},
+        set_cookie_headers=[
+            "__Secure-SID=a; Path=/",
+            "httponly_pref=b; Path=/",
+            "samesite_x=c; Path=/",
+        ],
+    )
+    findings = scanner._check_cookie_security(response, "http://127.0.0.1")
+    asyncio.run(scanner.close())
+
+    assert len(findings) == 9
+    assert sum("HttpOnly" in f.name for f in findings) == 3
+    assert sum("Secure" in f.name for f in findings) == 3
+    assert sum("SameSite" in f.name for f in findings) == 3
+
+
+def test_cookie_with_all_flags_reports_nothing() -> None:
+    scanner = WebScanner(Scope(name="t", ip_addresses=["127.0.0.1"]))
+    response = HTTPResponse(
+        status_code=200,
+        headers={},
+        set_cookie_headers=["sid=a; Path=/; HttpOnly; Secure; SameSite=Lax"],
+    )
+    findings = scanner._check_cookie_security(response, "http://127.0.0.1")
+    asyncio.run(scanner.close())
+
+    assert findings == []
+
+
 async def test_redirect_outside_scope_is_not_followed() -> None:
     scope = Scope(name="t", ip_addresses=["127.0.0.1"])
     scanner = WebScanner(scope)

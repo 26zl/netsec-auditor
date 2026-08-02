@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ipaddress
 import shutil
 
 from netsec_auditor.utils.logging import get_logger
@@ -46,7 +47,14 @@ async def masscan_discover(
     if not ports:
         logger.warning("masscan_no_ports")
         return None
-    args = ["masscan", *cidrs, "-p", ports, "--rate", str(rate), "-oL", "-"]
+    # masscan has no "--" terminator, so each range is validated instead: a target
+    # beginning with "-" would otherwise be parsed as a flag.
+    try:
+        targets = [str(ipaddress.ip_network(cidr, strict=False)) for cidr in cidrs]
+    except ValueError as exc:
+        logger.warning("masscan_invalid_target", error=str(exc))
+        return None
+    args = ["masscan", *targets, "-p", ports, "--rate", str(rate), "-oL", "-"]
     try:
         proc = await asyncio.create_subprocess_exec(
             *args,

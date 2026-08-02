@@ -19,6 +19,7 @@ import struct
 from netsec_auditor.protocols.base import (
     ProbeResult,
     ProbeSpec,
+    read_framed,
     tcp_request,
     udp_request,
 )
@@ -44,8 +45,27 @@ _MODBUS_DEVICE_ID_OBJECTS = {
 }
 
 
-def build_modbus_request(unit_id: int = 0, transaction_id: int = 1) -> bytes:
-    """Read Device Identification request (FC 0x2B / MEI 0x0E, basic category)."""
+# Public Modbus function codes, used to reject non-Modbus binary replies.
+_MODBUS_FUNCTION_CODES = frozenset(
+    {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x0B, 0x0C,
+     0x0F, 0x10, 0x11, 0x14, 0x15, 0x16, 0x17, 0x18, 0x2B}
+)
+
+
+def modbus_frame_length(data: bytes) -> int | None:
+    """Total Modbus/TCP frame size: 6-byte MBAP prefix plus its length field."""
+    if len(data) < 6:
+        return None
+    return 6 + struct.unpack(">H", data[4:6])[0]
+
+
+def build_modbus_request(unit_id: int = 0xFF, transaction_id: int = 1) -> bytes:
+    """Read Device Identification request (FC 0x2B / MEI 0x0E, basic category).
+
+    Unit id 0xFF is what the MODBUS Messaging Implementation Guide specifies for a
+    device addressed directly over TCP; 0x00 is the broadcast convention and a
+    TCP-to-RTU gateway may relay it onto the serial line.
+    """
     pdu = bytes((0x2B, 0x0E, 0x01, 0x00))  # FC, MEI type, read-id code=basic, object id 0
     length = len(pdu) + 1  # +1 accounts for the unit-id byte
     header = struct.pack(">HHHB", transaction_id, 0x0000, length, unit_id)  # MBAP header
@@ -57,8 +77,13 @@ def parse_modbus_response(data: bytes) -> dict[str, str]:
     try:
         if len(data) < 8:
             return {}
-        _tid, proto, _length, _unit = struct.unpack(">HHHB", data[:7])
+        _tid, proto, length, _unit = struct.unpack(">HHHB", data[:7])
         if proto != 0x0000:  # MBAP protocol id must be 0 for Modbus
+            return {}
+        # MBAP length counts the unit id and PDU, so it must cover at least the
+        # function code and cannot claim more bytes than arrived. This rejects the
+        # all-zero frame that any 8-byte reply would otherwise pass.
+        if length < 2 or length > len(data) - 6:
             return {}
         fc = data[7]
         if fc == 0x2B and len(data) > 8 and data[8] == 0x0E:
@@ -70,7 +95,9 @@ def parse_modbus_response(data: bytes) -> dict[str, str]:
         if fc & 0x80:  # exception reply, still a Modbus speaker
             code = data[8] if len(data) > 8 else 0
             return {"exception_code": f"0x{code:02x}"}
-        return {"function_code": f"0x{fc:02x}"}
+        if fc in _MODBUS_FUNCTION_CODES:
+            return {"function_code": f"0x{fc:02x}"}
+        return {}
     except (struct.error, IndexError):
         return {}
 
@@ -115,7 +142,9 @@ def _parse_modbus_report_slave_id(data: bytes) -> dict[str, str]:
 async def probe_modbus(host: str, port: int, timeout: float) -> ProbeResult | None:
     """Identify a Modbus/TCP device via Read Device Identification."""
     try:
-        data = await tcp_request(host, port, build_modbus_request(), timeout)
+        data = await tcp_request(
+            host, port, build_modbus_request(), timeout, frame_length=modbus_frame_length
+        )
         if not data:
             return None
         info = parse_modbus_response(data)
@@ -151,6 +180,23 @@ _S7_SZL_1C_INDEX = {
 def _tpkt(payload: bytes) -> bytes:
     # TPKT: version 3, reserved 0, 16-bit total length including this 4-byte header
     return struct.pack(">BBH", 0x03, 0x00, len(payload) + 4) + payload
+
+
+def tpkt_frame_length(data: bytes) -> int | None:
+    """Total TPKT frame size, read from its 16-bit length field."""
+    if len(data) < 4:
+        return None
+    return struct.unpack(">H", data[2:4])[0]
+
+
+def build_cotp_disconnect(dst_ref: int = 0x0000, src_ref: int = 0x0001) -> bytes:
+    """COTP Disconnect Request (TPDU type 0x80), reason 0 = not specified.
+
+    A transport-layer teardown, not an S7 control function: S7-300/400 CPUs have a
+    small fixed connection pool and a bare TCP FIN can leave the slot allocated.
+    """
+    body = struct.pack(">BHHB", 0x80, dst_ref, src_ref, 0x00)
+    return _tpkt(bytes((len(body),)) + body)
 
 
 def build_s7_cotp_cr(
@@ -256,20 +302,24 @@ async def _s7_exchange(
     try:
         writer.write(build_s7_cotp_cr())
         await writer.drain()
-        cc = await asyncio.wait_for(reader.read(2048), timeout)
-        if not cc or len(cc) < 6 or (cc[5] & 0xF0) != 0xD0:  # COTP Connection Confirm 0xD0
+        cc = await read_framed(reader, timeout, tpkt_frame_length)
+        # TPKT version 3 must be present too, or any binary service on 102 passes.
+        if len(cc) < 6 or cc[0] != 0x03 or (cc[5] & 0xF0) != 0xD0:  # CC TPDU type 0xD0
             return (False, None)
         cotp_ok = True
         writer.write(build_s7_setup_communication())
         await writer.drain()
-        await asyncio.wait_for(reader.read(2048), timeout)
+        await read_framed(reader, timeout, tpkt_frame_length)
         writer.write(build_s7_szl_request())
         await writer.drain()
-        szl = await asyncio.wait_for(reader.read(2048), timeout)
+        szl = await read_framed(reader, timeout, tpkt_frame_length)
         return (cotp_ok, szl)
     except (TimeoutError, ConnectionError, OSError):
         return (cotp_ok, None)
     finally:
+        if cotp_ok:  # release the PLC's connection slot; close() flushes it
+            with contextlib.suppress(ConnectionError, OSError):
+                writer.write(build_cotp_disconnect())
         writer.close()
         with contextlib.suppress(ConnectionError, OSError):
             await writer.wait_closed()
@@ -299,6 +349,13 @@ async def probe_s7(host: str, port: int, timeout: float) -> ProbeResult | None:
 
 _ENIP_LIST_IDENTITY = 0x0063
 _CIP_IDENTITY_ITEM = 0x000C
+
+
+def enip_frame_length(data: bytes) -> int | None:
+    """Total ENIP frame size: 24-byte encapsulation header plus its length field."""
+    if len(data) < 4:
+        return None
+    return 24 + struct.unpack("<H", data[2:4])[0]
 
 
 def build_enip_request(sender_context: bytes = b"") -> bytes:
@@ -352,8 +409,13 @@ async def _run_enip(
     host: str, port: int, timeout: float, transport: str
 ) -> ProbeResult | None:
     try:
-        sender = udp_request if transport == "udp" else tcp_request
-        data = await sender(host, port, build_enip_request(), timeout)
+        request = build_enip_request()
+        if transport == "udp":
+            data = await udp_request(host, port, request, timeout)
+        else:
+            data = await tcp_request(
+                host, port, request, timeout, frame_length=enip_frame_length
+            )
         if not data:
             return None
         info = parse_enip_response(data)
@@ -385,12 +447,17 @@ async def probe_enip_udp(host: str, port: int, timeout: float) -> ProbeResult | 
 
 
 def build_bacnet_request() -> bytes:
-    """Unconfirmed Who-Is (global broadcast) to elicit an I-Am reply."""
+    """Unconfirmed Who-Is addressed to one device, to elicit an I-Am reply.
+
+    Deliberately unicast with no DNET: a global-broadcast Who-Is (BVLC 0x0B, DNET
+    0xFFFF) reaching a BBMD is redistributed to its whole broadcast distribution
+    table, including slow MS/TP field segments well outside the scanned host.
+    """
     apdu = bytes((0x10, 0x08))  # Unconfirmed-Request PDU, service choice 0x08 = Who-Is
-    npdu = bytes((0x01, 0x20, 0xFF, 0xFF, 0x00, 0xFF))  # dest present, DNET 0xFFFF, hop 255
+    npdu = bytes((0x01, 0x00))  # version 1, control 0x00 = local, no routing
     body = npdu + apdu
-    # BVLC: type 0x81 (BACnet/IP), function 0x0B (Original-Broadcast-NPDU), total length
-    return struct.pack(">BBH", 0x81, 0x0B, len(body) + 4) + body
+    # BVLC: type 0x81 (BACnet/IP), function 0x0A (Original-Unicast-NPDU), total length
+    return struct.pack(">BBH", 0x81, 0x0A, len(body) + 4) + body
 
 
 def parse_bacnet_response(data: bytes) -> dict[str, str]:
@@ -490,6 +557,19 @@ def dnp3_crc(data: bytes) -> int:
     return (crc ^ 0xFFFF) & 0xFFFF
 
 
+_DNP3_HEADER_LEN = 10  # start(2) length(1) control(1) dst(2) src(2) crc(2)
+
+# Outstations silently discard frames addressed elsewhere and 0 is not a broadcast
+# address (0xFFFD/0xFFFE/0xFFFF are), so a single dst=0 attempt misses almost every
+# real device. These are the common defaults across vendors and demo configurations.
+_DNP3_LINK_ADDRESSES = (0, 1, 3, 4, 10, 1024)
+
+
+def dnp3_frame_length(data: bytes) -> int | None:
+    """The link header is all this probe parses, so that is the frame it waits for."""
+    return _DNP3_HEADER_LEN
+
+
 def build_dnp3_request(dst: int = 0, src: int = 0) -> bytes:
     """Data-link Request Link Status frame (function 0x09)."""
     # Header: start 0x0564, length 5, control 0xC9 (DIR|PRM, FC 9), dest/src little-endian.
@@ -498,9 +578,13 @@ def build_dnp3_request(dst: int = 0, src: int = 0) -> bytes:
 
 
 def parse_dnp3_response(data: bytes) -> dict[str, str]:
-    """Detect a DNP3 frame (0x05 0x64) and read its link header."""
+    """Detect a DNP3 frame (0x05 0x64) and read its CRC-validated link header."""
     try:
-        if len(data) < 8 or data[0] != 0x05 or data[1] != 0x64:  # DNP3 start octets
+        if len(data) < _DNP3_HEADER_LEN or data[0] != 0x05 or data[1] != 0x64:
+            return {}
+        # Without the CRC check any service whose reply starts 05 64 is fingerprinted
+        # as an outstation and flagged is_ot.
+        if dnp3_crc(data[:8]) != struct.unpack("<H", data[8:10])[0]:
             return {}
         length, control = data[2], data[3]
         dst, src = struct.unpack("<HH", data[4:8])
@@ -517,12 +601,24 @@ def parse_dnp3_response(data: bytes) -> dict[str, str]:
 
 
 async def probe_dnp3(host: str, port: int, timeout: float) -> ProbeResult | None:
-    """Detect a DNP3 outstation via a Request Link Status frame."""
+    """Detect a DNP3 outstation via a Request Link Status frame.
+
+    Each candidate link address gets an equal slice of ``timeout`` so the whole
+    sweep stays inside the caller's budget rather than multiplying it.
+    """
+    per_try = timeout / len(_DNP3_LINK_ADDRESSES)
+    info: dict[str, str] = {}
     try:
-        data = await tcp_request(host, port, build_dnp3_request(), timeout)
-        if not data:
-            return None
-        info = parse_dnp3_response(data)
+        for dst in _DNP3_LINK_ADDRESSES:
+            data = await tcp_request(
+                host, port, build_dnp3_request(dst=dst), per_try,
+                frame_length=dnp3_frame_length,
+            )
+            if not data:
+                continue
+            info = parse_dnp3_response(data)
+            if info:
+                break
     except Exception:
         return None
     if not info:
@@ -540,6 +636,13 @@ async def probe_dnp3(host: str, port: int, timeout: float) -> ProbeResult | None
 # OPC-UA (port 4840, TCP)
 
 _OPCUA_MESSAGE_TYPES = ("HEL", "ACK", "ERR", "OPN", "MSG", "CLO")
+
+
+def opcua_frame_length(data: bytes) -> int | None:
+    """Total OPC-UA message size, read from the 4-byte MessageSize field."""
+    if len(data) < 8:
+        return None
+    return struct.unpack("<I", data[4:8])[0]
 
 
 def build_opcua_request(endpoint_url: str) -> bytes:
@@ -584,7 +687,9 @@ async def probe_opcua(host: str, port: int, timeout: float) -> ProbeResult | Non
     """Detect an OPC-UA server via a Hello / Acknowledge exchange."""
     try:
         payload = build_opcua_request(f"opc.tcp://{host}:{port}")
-        data = await tcp_request(host, port, payload, timeout)
+        data = await tcp_request(
+            host, port, payload, timeout, frame_length=opcua_frame_length
+        )
         if not data:
             return None
         info = parse_opcua_response(data)

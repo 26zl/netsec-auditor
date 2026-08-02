@@ -45,3 +45,54 @@ jobs:
 
       - name: Test (pytest)
         run: pytest
+
+  audit:
+    name: dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Fails the build on a dependency with a known advisory. Kept separate from
+      # the test matrix so a new CVE is reported once, not three times.
+      - name: Audit dependencies (pip-audit)
+        uses: pypa/gh-action-pip-audit@v1.1.0
+        with:
+          inputs: .
+
+  lockfile:
+    name: uv.lock is current
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+
+      # The matrix installs with pip (the path users get from PyPI); this job
+      # exists so the committed lockfile cannot silently drift from pyproject.
+      - name: Verify the lockfile resolves
+        run: uv sync --frozen --all-extras
+
+  docker:
+    name: docker image builds
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      # The README documents a local image build; without this the Dockerfile can
+      # break silently since nothing else exercises it.
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: netsec-auditor:ci
+
+      - name: Smoke-test the entrypoint
+        run: docker run --rm netsec-auditor:ci doctor

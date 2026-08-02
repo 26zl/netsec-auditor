@@ -17,18 +17,18 @@ from netsec_auditor.wireless.wifi import (
 
 
 def _terse_row(**fields: str) -> str:
-    """Build one `nmcli -t -f ALL` row, escaping ':' inside values (the BSSID)."""
+    """Build one terse nmcli row in the explicitly requested field order.
+
+    Values are escaped the way nmcli escapes them, so a ':' inside a value (the
+    BSSID, or a crafted SSID) does not become a field separator.
+    """
     order = (
-        "NAME", "SSID", "SSID-HEX", "BSSID", "MODE", "CHAN", "FREQ", "RATE",
-        "SIGNAL", "BARS", "SECURITY", "WPA-FLAGS", "RSN-FLAGS", "DEVICE",
-        "ACTIVE", "IN-USE", "DBUS-PATH",
+        "SSID", "BSSID", "CHAN", "FREQ", "SIGNAL", "SECURITY", "WPA-FLAGS", "RSN-FLAGS",
     )
-    values = {"NAME": "AP", "MODE": "Infra", "BARS": "**", "DEVICE": "wlan0", "ACTIVE": "no"}
-    values.update(fields)
-    return ":".join(values.get(name, "").replace(":", r"\:") for name in order)
+    return ":".join(fields.get(name, "").replace(":", r"\:") for name in order)
 
 
-# `nmcli -t -f ALL dev wifi list` terse rows: open, WEP, WPA2-PSK, WPA3-SAE.
+# Terse rows for the requested field list: open, WEP, WPA2-PSK, WPA3-SAE.
 NMCLI_SAMPLE = "\n".join([
     _terse_row(SSID="CoffeeShop", BSSID="AA:BB:CC:00:00:01", CHAN="6",
                FREQ="2437 MHz", SIGNAL="70", SECURITY=""),
@@ -137,6 +137,64 @@ def test_parse_nmcli_ignores_blank_and_garbage_lines() -> None:
     assert parse_nmcli("not-a-real-row\n\n") == []
 
 
+def test_parse_nmcli_ssid_that_looks_like_a_mac_does_not_shift_columns() -> None:
+    # A hostile AP can broadcast an SSID shaped like a BSSID; columns must stay
+    # positional so its security posture is still read from the right field.
+    row = _terse_row(SSID="AA:BB:CC:DD:EE:FF", BSSID="11:22:33:44:55:66", CHAN="11",
+                     FREQ="2462 MHz", SIGNAL="80", SECURITY="WPA2",
+                     **{"RSN-FLAGS": "pair_ccmp group_ccmp psk"})
+    aps = parse_nmcli(row)
+    assert len(aps) == 1
+    ap = aps[0]
+    assert ap.bssid == "11:22:33:44:55:66"
+    assert ap.ssid == "AA:BB:CC:DD:EE:FF"
+    assert ap.encryption == "wpa2"
+    assert ap.cipher == "CCMP"
+    assert -100 <= ap.signal_dbm < 0
+
+
+def test_parse_nmcli_reports_every_cipher_in_mixed_mode() -> None:
+    row = _terse_row(SSID="Mixed", BSSID="11:22:33:44:55:77", CHAN="6", SECURITY="WPA2",
+                     **{"RSN-FLAGS": "pair_ccmp pair_tkip group_tkip psk"})
+    ap = parse_nmcli(row)[0]
+    assert "TKIP" in ap.ciphers
+    assert any("TKIP" in issue for issue in assess_access_point(ap))
+
+
+def test_parse_nmcli_owe_is_not_reported_as_open() -> None:
+    row = _terse_row(SSID="EnhancedOpen", BSSID="11:22:33:44:55:88", CHAN="6",
+                     SECURITY="OWE", **{"RSN-FLAGS": "pair_ccmp group_ccmp owe"})
+    ap = parse_nmcli(row)[0]
+    assert ap.encryption == "owe"
+    assert all("Open network" not in issue for issue in assess_access_point(ap))
+
+
+def test_parse_nmcli_ambiguous_channel_has_no_band() -> None:
+    # Channel 20 is unassigned in 2.4 GHz and reused by 6 GHz, so with no
+    # frequency to disambiguate the band must be left empty, not guessed.
+    ap = parse_nmcli(_terse_row(SSID="X", BSSID="11:22:33:44:55:99", CHAN="20"))[0]
+    assert ap.band == ""
+
+
+async def test_scan_wifi_nmcli_argv_is_explicit_and_does_not_rescan(monkeypatch) -> None:
+    seen: list[list[str]] = []
+
+    async def fake_run(cmd: list[str], timeout: float = 20.0) -> str:
+        seen.append(cmd)
+        return ""
+
+    monkeypatch.setattr("netsec_auditor.wireless.wifi.shutil.which",
+                        lambda name: "/usr/bin/nmcli" if name == "nmcli" else None)
+    monkeypatch.setattr("netsec_auditor.wireless.wifi._run_command", fake_run)
+    await scan_wifi(iface=None, duration=0.0, use_scapy=False)
+
+    assert len(seen) == 1
+    argv = seen[0]
+    assert argv[:4] == ["nmcli", "-t", "-f",
+                        "SSID,BSSID,CHAN,FREQ,SIGNAL,SECURITY,WPA-FLAGS,RSN-FLAGS"]
+    assert argv[-2:] == ["--rescan", "no"]
+
+
 # parse_iw_scan
 
 
@@ -165,6 +223,68 @@ def test_parse_iw_scan_empty() -> None:
     assert parse_iw_scan("") == []
 
 
+def test_parse_iw_scan_keeps_every_cipher_in_mixed_mode() -> None:
+    # WPA2 in CCMP+TKIP mixed mode: the weak cipher must survive parsing.
+    text = """BSS aa:bb:cc:99:00:01(on wlan0)
+    freq: 2437
+    SSID: MixedMode
+    RSN:  * Version: 1
+          * Group cipher: TKIP
+          * Pairwise ciphers: CCMP TKIP
+          * Authentication suites: PSK
+"""
+    ap = parse_iw_scan(text)[0]
+    assert set(ap.ciphers) == {"CCMP", "TKIP"}
+    assert ap.cipher == "TKIP+CCMP"  # readable single-string form is preserved
+    assert any("TKIP" in issue for issue in assess_access_point(ap))
+
+
+def test_parse_iw_scan_ccmp_256_is_not_also_read_as_ccmp() -> None:
+    text = """BSS aa:bb:cc:99:00:02(on wlan0)
+    freq: 5180
+    SSID: SuiteB
+    RSN:  * Version: 1
+          * Group cipher: CCMP-256
+          * Pairwise ciphers: CCMP-256
+          * Authentication suites: PSK
+"""
+    assert parse_iw_scan(text)[0].ciphers == ["CCMP-256"]
+
+
+def test_parse_iw_scan_owe_is_not_reported_as_open() -> None:
+    text = """BSS aa:bb:cc:99:00:03(on wlan0)
+    freq: 2437
+    SSID: EnhancedOpen
+    RSN:  * Version: 1
+          * Group cipher: CCMP
+          * Pairwise ciphers: CCMP
+          * Authentication suites: OWE
+"""
+    ap = parse_iw_scan(text)[0]
+    assert ap.encryption == "owe"
+    assert ap.auth == "OWE"
+    assert all("Open network" not in issue for issue in assess_access_point(ap))
+
+
+def test_parse_iw_scan_6ghz_frequency_yields_positive_channel() -> None:
+    # 5935 MHz sits below the first 6 GHz centre frequency; the derived channel
+    # must never go negative.
+    text = """BSS aa:bb:cc:99:00:04(on wlan0)
+    freq: 5935
+    SSID: SixGig
+    capability: ESS (0x0421)
+BSS aa:bb:cc:99:00:05(on wlan0)
+    freq: 5955
+    SSID: SixGigOne
+    capability: ESS (0x0421)
+"""
+    aps = _by_bssid(parse_iw_scan(text))
+    low = aps["AA:BB:CC:99:00:04"]
+    assert low.channel >= 1
+    assert low.band == "6GHz"
+    assert aps["AA:BB:CC:99:00:05"].channel == 1
+
+
 # parse_airport_json
 
 
@@ -185,6 +305,56 @@ def test_parse_airport_json_maps_networks() -> None:
     assert guest.encryption == "open"
     assert guest.band == "2.4GHz"
     assert guest.signal_dbm == -70
+
+
+def test_parse_airport_json_without_bssid_leaves_bssid_empty() -> None:
+    # macOS withholds the BSSID without location permission; writing the SSID
+    # there would fake a BSSID and break evil-twin detection.
+    data = {
+        "SPAirPortDataType": [
+            {
+                "spairport_airport_interfaces": [
+                    {
+                        "_name": "en0",
+                        "spairport_airport_other_local_wireless_networks": [
+                            {
+                                "_name": "NoBssidNet",
+                                "spairport_network_channel": "6 (2GHz, 20MHz)",
+                                "spairport_security_mode": "spairport_security_mode_none",
+                            }
+                        ],
+                    }
+                ]
+            }
+        ]
+    }
+    aps = parse_airport_json(data)
+    assert len(aps) == 1
+    assert aps[0].bssid == ""
+    assert aps[0].ssid == "NoBssidNet"
+    assert aps[0].key == "ssid:NoBssidNet"  # de-duplicated by SSID instead
+
+
+def test_parse_airport_json_sanitizes_ssid_markup_and_control_characters() -> None:
+    data = {
+        "SPAirPortDataType": [
+            {
+                "spairport_airport_interfaces": [
+                    {
+                        "_name": "en0",
+                        "spairport_airport_other_local_wireless_networks": [
+                            {
+                                "_name": "Evil\x1b[31mAP\x07\n",
+                                "spairport_network_channel": "6 (2GHz, 20MHz)",
+                                "spairport_security_mode": "spairport_security_mode_none",
+                            }
+                        ],
+                    }
+                ]
+            }
+        ]
+    }
+    assert parse_airport_json(data)[0].ssid == "Evil[31mAP"
 
 
 def test_parse_airport_json_handles_bad_input() -> None:
@@ -214,6 +384,24 @@ def test_parse_rsn_information_sae_is_wpa3() -> None:
     info = parse_rsn_information(raw)
     assert info["auth"] == "SAE"
     assert info["encryption"] == "wpa3"
+
+
+def test_parse_rsn_information_keeps_mixed_ccmp_tkip() -> None:
+    # version=1 | group TKIP | 2x pairwise (CCMP, TKIP) | 1x AKM PSK | RSN caps
+    raw = bytes.fromhex("0100000fac020200000fac04000fac020100000fac020000")
+    info = parse_rsn_information(raw)
+    assert info["pairwise_ciphers"] == ["CCMP", "TKIP"]
+    assert info["cipher"] == "CCMP+TKIP"
+
+
+def test_parse_rsn_information_owe_is_not_open() -> None:
+    # Same layout as the PSK vector but AKM suite type 18 (OWE).
+    raw = bytes.fromhex("0100000fac040100000fac040100000fac120000")
+    info = parse_rsn_information(raw)
+    assert info["akms"] == ["OWE"]
+    assert info["encryption"] == "owe"
+    ap = AccessPoint(bssid="AA:BB:CC:00:00:20", encryption=info["encryption"])
+    assert all("Open network" not in issue for issue in assess_access_point(ap))
 
 
 def test_parse_rsn_information_truncated_never_raises() -> None:

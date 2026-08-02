@@ -208,20 +208,22 @@ async def probe_chargen(host: str, port: int, timeout: float) -> ProbeResult | N
 # SSDP / UPnP (1900/udp) — reflector exposure (distinct from iot discovery)
 
 
-def build_ssdp_amp_request() -> bytes:
-    """Reuse the iot M-SEARCH ``ssdp:all`` request as a reflector trigger.
+def build_ssdp_amp_request(host: str, port: int = 1900) -> bytes:
+    """Build an M-SEARCH ``ssdp:all`` request addressed to ``host`` as a reflector trigger.
 
-    Identical on the wire to :func:`netsec_auditor.protocols.iot.build_ssdp_request`
-    (``M-SEARCH * HTTP/1.1`` … ``ST: ssdp:all``); the distinction is the finding —
-    here a unicast reply means the host is an exploitable UPnP/SSDP reflector.
+    Same request as :func:`netsec_auditor.protocols.iot.build_ssdp_request`, but the
+    target must be passed through: a unicast datagram carrying the multicast
+    ``HOST: 239.255.255.250:1900`` deviates from UPnP DA 1.1 and strict devices drop
+    it, which would under-report the reflector finding. The distinction from the iot
+    discovery probe is the finding — here a reply means an exploitable reflector.
     """
-    return build_ssdp_request(st="ssdp:all")
+    return build_ssdp_request(host, port, st="ssdp:all")
 
 
 async def probe_ssdp_amp(host: str, port: int, timeout: float) -> ProbeResult | None:
     """Probe for a UPnP/SSDP reflector via a unicast M-SEARCH."""
     try:
-        data = await udp_request(host, port, build_ssdp_amp_request(), timeout)
+        data = await udp_request(host, port, build_ssdp_amp_request(host, port), timeout)
         if not data:
             return None
         return _reflector_result(
@@ -237,8 +239,8 @@ async def probe_ssdp_amp(host: str, port: int, timeout: float) -> ProbeResult | 
 
 
 # Registry — all read-only, single-query UDP reflector-exposure probes.
-# Deliberately NOT registered here (no register() call); the port-indexed
-# registry already carries the iot SSDP discovery prober on 1900.
+# ``ssdp-amp`` shares UDP 1900 with the iot ``ssdp`` discovery prober on purpose:
+# both run and report separate findings (device identity vs reflector exposure).
 
 SPECS: list[ProbeSpec] = [
     ProbeSpec(

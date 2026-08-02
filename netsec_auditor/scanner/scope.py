@@ -95,7 +95,7 @@ class Scope:
             self._validate_network(host, target)
             return []
 
-        if self._domain_matches(host, self.excluded_domains):
+        if self._domain_matches(host, self.excluded_domains, include_subdomains=True):
             raise ScopeError(f"Target {target} is an explicitly excluded domain")
 
         ips = self._resolve_to_ips(host)
@@ -186,14 +186,24 @@ class Scope:
         return target
 
     @staticmethod
-    def _domain_matches(host: str, patterns: list[str]) -> bool:
-        """Match a host against domain patterns, supporting '*.example.com' wildcards."""
+    def _domain_matches(
+        host: str, patterns: list[str], *, include_subdomains: bool = False
+    ) -> bool:
+        """Match a host against domain patterns, supporting '*.example.com' wildcards.
+
+        ``include_subdomains`` also matches everything beneath a bare pattern. It is
+        set for exclusions so that excluding ``prod.example.com`` also excludes
+        ``db.prod.example.com`` — an exclusion that silently covered less than the
+        operator intended would authorize scanning the host they meant to protect.
+        """
         host = host.lower().rstrip(".")
         for pattern in patterns:
             pattern = pattern.lower().rstrip(".")
             if pattern == host:
                 return True
             if pattern.startswith("*.") and host.endswith(pattern[1:]):
+                return True
+            if include_subdomains and host.endswith(f".{pattern}"):
                 return True
         return False
 

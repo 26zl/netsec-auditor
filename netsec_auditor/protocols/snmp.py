@@ -6,9 +6,17 @@ on ``private``). This probe only issues GET requests — never SET — and retur
 the system description. The BER/ASN.1 encoding is done by hand so no third-party
 SNMP library is required. Pure ``build_snmp_get``/``parse_snmp_response`` helpers
 make it unit-testable without a network.
+
+Guessing the ``private`` read-write community is a default-credential attempt that
+embedded and OT SNMP agents commonly log or alert on, so the spec is marked
+``is_safe=False`` and the profile gate skips it outside the IT profile. One probe
+sends four datagrams — two communities x SNMPv2c/v1 — concurrently, so a silent
+host costs one timeout rather than four.
 """
 
 from __future__ import annotations
+
+import asyncio
 
 from netsec_auditor.protocols.base import ProbeResult, ProbeSpec, udp_request
 
@@ -99,32 +107,52 @@ def parse_snmp_response(data: bytes) -> dict[str, str]:
         return {}
 
 
+async def _snmp_attempt(
+    host: str, port: int, community: str, version: int, timeout: float
+) -> ProbeResult | None:
+    """Send one GET and build a result if the agent answered."""
+    request = build_snmp_get(community, version=version)
+    data = await udp_request(host, port, request, timeout)
+    if not data:
+        return None
+    info = parse_snmp_response(data)
+    if not info:
+        return None
+    return ProbeResult(
+        protocol="snmp",
+        port=port,
+        transport="udp",
+        is_ot=False,
+        device_info={
+            "default_community": community,
+            "version": "v2c" if version == 1 else "v1",
+            "sys_descr": info.get("value", ""),
+        },
+        banner=info.get("value", ""),
+    )
+
+
 async def probe_snmp(host: str, port: int, timeout: float) -> ProbeResult | None:
-    """Probe for an SNMP agent answering a default community string."""
-    for community in _DEFAULT_COMMUNITIES:
-        for version in (1, 0):  # try v2c then v1
-            request = build_snmp_get(community, version=version)
-            data = await udp_request(host, port, request, timeout)
-            if not data:
-                continue
-            info = parse_snmp_response(data)
-            if not info:
-                continue
-            return ProbeResult(
-                protocol="snmp",
-                port=port,
-                transport="udp",
-                is_ot=False,
-                device_info={
-                    "default_community": community,
-                    "version": "v2c" if version == 1 else "v1",
-                    "sys_descr": info.get("value", ""),
-                },
-                banner=info.get("value", ""),
-            )
-    return None
+    """Probe for an SNMP agent answering a default community string.
+
+    A UDP miss is silent, so the four community/version combinations run
+    concurrently; the ordering of ``results`` keeps public/v2c the preferred hit.
+    """
+    results = await asyncio.gather(*(
+        _snmp_attempt(host, port, community, version, timeout)
+        for community in _DEFAULT_COMMUNITIES
+        for version in (1, 0)  # v2c before v1
+    ))
+    return next((r for r in results if r is not None), None)
 
 
 SPECS: list[ProbeSpec] = [
-    ProbeSpec(name="snmp", default_port=SNMP_PORT, transport="udp", is_ot=False, probe=probe_snmp),
+    ProbeSpec(
+        name="snmp",
+        default_port=SNMP_PORT,
+        transport="udp",
+        is_ot=False,
+        probe=probe_snmp,
+        is_safe=False,  # guesses the read-write community, so not a passive probe
+    ),
 ]

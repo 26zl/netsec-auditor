@@ -9,11 +9,7 @@ from typing import Any
 import structlog
 
 
-def configure_logging(
-    level: str = "INFO",
-    json_output: bool = False,
-    log_file: str | None = None,
-) -> None:
+def configure_logging(level: str = "INFO", json_output: bool = False) -> None:
     """Configure structured logging for the application."""
 
     timestamper = structlog.processors.TimeStamper(fmt="iso")
@@ -51,11 +47,6 @@ def configure_logging(
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
-
-    if log_file:
-        file_handler = logging.FileHandler(log_file)
-        file_handler.setLevel(log_level)
-        logging.getLogger().addHandler(file_handler)
 
 
 def get_logger(name: str) -> structlog.stdlib.BoundLogger:

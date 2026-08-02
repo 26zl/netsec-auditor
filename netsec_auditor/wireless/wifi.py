@@ -1,15 +1,16 @@
-"""Passive / read-only Wi-Fi reconnaissance.
+"""Read-only Wi-Fi reconnaissance — no deauth, no handshake capture, no injection.
 
-Two capture strategies, both strictly observational — no deauth, no handshake
-capture, no injection:
+Two capture strategies, which differ in whether anything is transmitted:
 
-* **scapy monitor mode** (primary): sniffs 802.11 Beacon/ProbeResp management
-  frames and passively watches data frames to attribute clients to their AP.
-  Needs scapy, root, and an adapter in monitor mode (e.g. Kali NetHunter with an
-  external adapter). scapy is imported lazily so this module loads without it.
+* **scapy monitor mode** (primary): genuinely passive — sniffs 802.11
+  Beacon/ProbeResp management frames and watches data frames to attribute clients
+  to their AP, transmitting nothing. Needs scapy, root, and an adapter in monitor
+  mode (e.g. Kali NetHunter with an external adapter). scapy is imported lazily so
+  this module loads without it.
 * **OS scan tools** (fallback): parses the output of ``nmcli`` / ``iw`` on Linux
   and ``system_profiler`` on macOS. Used whenever scapy is missing or the process
-  is not root.
+  is not root. These delegate to the OS, which performs a normal *active* scan
+  (broadcast probe requests) — no attack frames, but not radio-silent.
 
 The tool-output parsers (:func:`parse_nmcli`, :func:`parse_iw_scan`,
 :func:`parse_airport_json`) and the RSN decoder (:func:`parse_rsn_information`)
@@ -34,6 +35,8 @@ from netsec_auditor.wireless.base import (
     AccessPoint,
     WirelessInventory,
     assess_access_point,
+    band_for_channel,
+    sanitize_name,
 )
 
 logger = get_logger(__name__)
@@ -70,16 +73,26 @@ _RSN_AKMS = {
 _WPA1_OUI_TYPE = b"\x00\x50\xf2\x01"    # Microsoft WPA (v1) information element
 _WPS_OUI_TYPE = b"\x00\x50\xf2\x04"     # Wi-Fi Protected Setup element
 
-# Field order of `nmcli -t -f ALL dev wifi list` (NetworkManager's
-# nmc_fields_dev_wifi_list); every terse row is prefixed with the group "AP".
+# Fields are requested explicitly so terse columns can be read positionally:
+# locating a column by content (e.g. the BSSID by MAC pattern) lets an AP whose
+# SSID looks like a MAC shift every following column.
 _NMCLI_FIELDS = (
-    "NAME", "SSID", "SSID-HEX", "BSSID", "MODE", "CHAN", "FREQ", "RATE",
-    "SIGNAL", "BARS", "SECURITY", "WPA-FLAGS", "RSN-FLAGS", "DEVICE",
-    "ACTIVE", "IN-USE", "DBUS-PATH",
+    "SSID", "BSSID", "CHAN", "FREQ", "SIGNAL", "SECURITY", "WPA-FLAGS", "RSN-FLAGS",
 )
+# --rescan no: report the cached scan list rather than triggering an active scan.
+_NMCLI_ARGV = [
+    "nmcli", "-t", "-f", ",".join(_NMCLI_FIELDS), "dev", "wifi", "list", "--rescan", "no",
+]
 
 _MAC_RE = re.compile(r"^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$")
 _IW_BSS_RE = re.compile(r"^BSS\s+([0-9a-fA-F:]{17})")
+
+# Cipher tokens as `iw scan` prints them, mapped to their canonical spelling.
+_IW_CIPHER_NAMES = {
+    "ccmp-256": "CCMP-256", "gcmp-256": "GCMP-256", "ccmp": "CCMP",
+    "gcmp": "GCMP", "tkip": "TKIP", "wep-104": "WEP-104", "wep-40": "WEP-40",
+    "wep": "WEP",
+}
 
 
 async def scan_wifi(
@@ -230,7 +243,7 @@ def _parse_scapy_ap(pkt: Any) -> AccessPoint | None:
 
     _apply_scapy_crypto(ap, pkt, rsn, wpa)
     ap.wps = wps
-    ap.band = _band_from_channel(ap.channel)
+    ap.band = band_for_channel(ap.channel)
     return ap
 
 
@@ -298,7 +311,7 @@ async def _scan_with_os_tools(inventory: WirelessInventory, iface: str | None) -
     aps: list[AccessPoint] = []
 
     if shutil.which("nmcli"):
-        text = await _run_command(["nmcli", "-t", "-f", "ALL", "dev", "wifi", "list"])
+        text = await _run_command(_NMCLI_ARGV)
         if text:
             aps = parse_nmcli(text)
 
@@ -360,17 +373,17 @@ def _default_wifi_iface() -> str | None:
     return None
 
 
-# Pure parser: `nmcli -t -f ALL dev wifi list`.
+# Pure parser: terse `nmcli dev wifi list` output.
 
 
 def parse_nmcli(text: str) -> list[AccessPoint]:
-    """Parse `nmcli -t -f ALL dev wifi list` terse output into access points.
+    """Parse the terse output of :data:`_NMCLI_ARGV` into access points.
 
     Terse mode separates fields with ``:`` and backslash-escapes ``:`` inside
     values (notably the BSSID), so each line is split on unescaped colons and
-    unescaped. Columns follow NetworkManager's ALL field order; the BSSID column
-    is located by MAC pattern so minor column-count differences degrade
-    gracefully. Unparseable lines are skipped. Never raises.
+    unescaped. Columns are read positionally against the explicitly requested
+    :data:`_NMCLI_FIELDS`; rows with a different column count are skipped.
+    Never raises.
     """
     aps: list[AccessPoint] = []
     for raw in text.splitlines():
@@ -408,17 +421,10 @@ def _split_terse(line: str) -> list[str]:
 
 
 def _nmcli_row(fields: list[str]) -> dict[str, str] | None:
-    """Map terse fields to named columns, anchored on the BSSID column."""
-    bssid_idx = next((i for i, f in enumerate(fields) if _MAC_RE.match(f)), None)
-    if bssid_idx is None:
+    """Map terse fields to the explicitly requested columns, positionally."""
+    if len(fields) != len(_NMCLI_FIELDS):
         return None
-    base = bssid_idx - _NMCLI_FIELDS.index("BSSID")
-
-    def get(name: str) -> str:
-        idx = base + _NMCLI_FIELDS.index(name)
-        return fields[idx] if 0 <= idx < len(fields) else ""
-
-    return {name: get(name) for name in _NMCLI_FIELDS}
+    return dict(zip(_NMCLI_FIELDS, fields, strict=True))
 
 
 def _ap_from_nmcli_row(row: dict[str, str]) -> AccessPoint | None:
@@ -427,10 +433,10 @@ def _ap_from_nmcli_row(row: dict[str, str]) -> AccessPoint | None:
     if not _MAC_RE.match(bssid):
         return None
     ap = AccessPoint(bssid=bssid, source="scan")
-    ap.ssid = row.get("SSID", "")
+    ap.ssid = sanitize_name(row.get("SSID", ""))
     ap.channel = _to_int(row.get("CHAN", ""))
     ap.signal_dbm = _nmcli_signal_to_dbm(row.get("SIGNAL", ""))
-    ap.band = _band_from_freq(_to_int(row.get("FREQ", ""))) or _band_from_channel(ap.channel)
+    ap.band = _band_from_freq(_to_int(row.get("FREQ", ""))) or band_for_channel(ap.channel)
     sec = _security_from_nmcli(row)
     ap.encryption = sec["encryption"]
     ap.cipher = sec["cipher"]
@@ -449,6 +455,8 @@ def _security_from_nmcli(row: dict[str, str]) -> dict[str, Any]:
         return result  # open network
     if "WEP" in tokens:
         result["encryption"] = "wep"
+    elif "OWE" in tokens or "OWE-TM" in tokens:
+        result["encryption"] = "owe"      # Enhanced Open: encrypted, unauthenticated
     elif "WPA3" in tokens or "SAE" in tokens or "sae" in flags:
         result["encryption"] = "wpa3"
     elif "WPA2" in tokens or "RSN" in tokens:
@@ -517,7 +525,7 @@ def _ap_from_iw_block(block: list[str]) -> AccessPoint | None:
         line = raw.strip()
         low = line.lower()
         if low.startswith("ssid:"):
-            ap.ssid = line.split(":", 1)[1].strip()
+            ap.ssid = sanitize_name(line.split(":", 1)[1].strip())
         elif low.startswith("freq:"):
             freq = _to_int(low.split(":", 1)[1])
         elif low.startswith("signal:"):
@@ -539,11 +547,16 @@ def _ap_from_iw_block(block: list[str]) -> AccessPoint | None:
             _collect_iw_crypto(low, ciphers, auths)
 
     ap.channel = ap.channel or _channel_from_freq(freq)
-    ap.band = _band_from_freq(freq) or _band_from_channel(ap.channel)
-    ap.cipher = _primary_cipher(ciphers)
+    ap.band = _band_from_freq(freq) or band_for_channel(ap.channel)
+    ap.cipher = _join_ciphers(ciphers)
     ap.auth = _first_auth(auths)
     if has_rsn:
-        ap.encryption = "wpa3" if "SAE" in auths else "wpa2"
+        if "SAE" in auths:
+            ap.encryption = "wpa3"
+        elif "OWE" in auths:
+            ap.encryption = "owe"
+        else:
+            ap.encryption = "wpa2"
     elif has_wpa:
         ap.encryption = "wpa"
     elif privacy:
@@ -555,13 +568,17 @@ def _ap_from_iw_block(block: list[str]) -> AccessPoint | None:
 
 
 def _collect_iw_crypto(low: str, ciphers: list[str], auths: list[str]) -> None:
-    """Read cipher / authentication-suite names from a line inside an RSN/WPA block."""
+    """Read every cipher / authentication-suite name from a line in an RSN/WPA block.
+
+    All ciphers are kept: a mixed CCMP+TKIP network is a real weakness that is
+    invisible if only the strongest cipher survives.
+    """
     if "cipher" in low:  # "Group cipher:" or "Pairwise ciphers:"
-        for name in ("ccmp-256", "gcmp-256", "ccmp", "gcmp", "tkip", "wep-104",
-                     "wep-40", "wep"):
-            if name in low:
-                ciphers.append(name.upper())
-                break
+        # Matched as whole tokens so "ccmp-256" is not also read as "ccmp".
+        for token in re.split(r"[\s,]+", low.split(":", 1)[-1]):
+            name = _IW_CIPHER_NAMES.get(token)
+            if name and name not in ciphers:
+                ciphers.append(name)
     elif "authentication suites:" in low or "akm:" in low:
         if "sae" in low:
             auths.append("SAE")
@@ -569,6 +586,8 @@ def _collect_iw_crypto(low: str, ciphers: list[str], auths: list[str]) -> None:
             auths.append("PSK")
         if "802.1x" in low or "eap" in low:
             auths.append("802.1X")
+        if "owe" in low:
+            auths.append("OWE")
 
 
 def _iw_signal_to_dbm(line: str) -> int:
@@ -585,9 +604,9 @@ def parse_airport_json(data: dict[str, Any]) -> list[AccessPoint]:
 
     Walks each Wi-Fi interface's discovered networks (and the currently
     associated one) and maps macOS security-mode strings to
-    encryption/cipher/auth. BSSID is used when present, otherwise the SSID keys
-    the entry (recent macOS omits BSSID without location permission). Never
-    raises.
+    encryption/cipher/auth. The BSSID is left empty when macOS withholds it
+    (no location permission); :attr:`AccessPoint.key` then falls back to the
+    SSID for de-duplication. Never raises.
     """
     aps: list[AccessPoint] = []
     if not isinstance(data, dict):
@@ -620,16 +639,18 @@ def _ap_from_airport_net(net: Any) -> AccessPoint | None:
     """Build an :class:`AccessPoint` from one macOS network dict."""
     if not isinstance(net, dict):
         return None
-    name = str(net.get("_name", "") or "")
+    name = sanitize_name(net.get("_name", ""))
+    # Recent macOS omits the BSSID without location permission; it stays empty
+    # rather than being filled with the SSID, which would defeat evil-twin
+    # detection and mislabel the reported BSSID.
     bssid = str(net.get("spairport_network_bssid", "") or "").upper()
-    identifier = bssid or name
-    if not identifier:
+    if not bssid and not name:
         return None
-    ap = AccessPoint(bssid=identifier, source="scan")
+    ap = AccessPoint(bssid=bssid, source="scan")
     ap.ssid = name
     channel_raw = str(net.get("spairport_network_channel", "") or "")
     ap.channel = _to_int(channel_raw)
-    ap.band = _airport_band(channel_raw) or _band_from_channel(ap.channel)
+    ap.band = _airport_band(channel_raw) or band_for_channel(ap.channel)
     ap.signal_dbm = _airport_signal(net.get("spairport_signal_noise", ""))
     sec = _airport_security(str(net.get("spairport_security_mode", "") or ""))
     ap.encryption = sec["encryption"]
@@ -690,11 +711,18 @@ def parse_rsn_information(raw: bytes) -> dict[str, Any]:
     ``raw`` is the element payload (scapy ``Dot11Elt.info``) beginning at the
     2-byte version field — id and length are already stripped. Returns the
     version, group/pairwise ciphers, AKM suites and the derived
-    encryption/cipher/auth (WPA3 when an SAE AKM is present, else WPA2).
-    Truncated or malformed input yields whatever could be read; never raises.
+    encryption/cipher/auth (WPA3 for an SAE AKM, OWE for Enhanced Open, else
+    WPA2). Truncated or malformed input yields whatever could be read; never
+    raises.
     """
     info = _parse_suite_body(raw)
-    info["encryption"] = "wpa3" if any("SAE" in a for a in info["akms"]) else "wpa2"
+    akms = info["akms"]
+    if any("SAE" in akm for akm in akms):
+        info["encryption"] = "wpa3"
+    elif "OWE" in akms:
+        info["encryption"] = "owe"
+    else:
+        info["encryption"] = "wpa2"
     return info
 
 
@@ -715,7 +743,7 @@ def _parse_suite_body(raw: bytes) -> dict[str, Any]:
     akms, pos = _read_suite_list(raw, pos, _RSN_AKMS)
     result["pairwise_ciphers"] = pairwise
     result["akms"] = akms
-    result["cipher"] = _primary_cipher(pairwise) or result["group_cipher"]
+    result["cipher"] = _join_ciphers(pairwise) or result["group_cipher"]
     result["auth"] = akms[0] if akms else ""
     return result
 
@@ -746,12 +774,13 @@ def _suite_name(selector: bytes, table: dict[int, str]) -> str:
     return table.get(selector[3], "")
 
 
-def _primary_cipher(ciphers: list[str]) -> str:
-    """Prefer a strong pairwise cipher; otherwise the first one present."""
-    for strong in ("CCMP", "GCMP", "GCMP-256", "CCMP-256"):
-        if strong in ciphers:
-            return strong
-    return ciphers[0] if ciphers else ""
+def _join_ciphers(ciphers: list[str]) -> str:
+    """Join every advertised cipher, in order, into one readable string."""
+    unique: list[str] = []
+    for name in ciphers:
+        if name and name not in unique:
+            unique.append(name)
+    return "+".join(unique)
 
 
 def _first_auth(auths: list[str]) -> str:
@@ -771,14 +800,8 @@ def _blank_security() -> dict[str, Any]:
 
 
 def _cipher_from_flags(flags: str) -> str:
-    """Pick a cipher name from lowercased nmcli WPA/RSN flag text."""
-    if "ccmp" in flags:
-        return "CCMP"
-    if "gcmp" in flags:
-        return "GCMP"
-    if "tkip" in flags:
-        return "TKIP"
-    return ""
+    """Join every cipher named in lowercased nmcli WPA/RSN flag text."""
+    return "+".join(name.upper() for name in ("ccmp", "gcmp", "tkip") if name in flags)
 
 
 def _auth_from_flags(flags: str, tokens: list[str]) -> str:
@@ -794,22 +817,13 @@ def _auth_from_flags(flags: str, tokens: list[str]) -> str:
     return ""
 
 
-def _band_from_channel(channel: int) -> str:
-    """Approximate the band from a channel number (2.4GHz vs 5GHz)."""
-    if 1 <= channel <= 14:
-        return "2.4GHz"
-    if channel >= 15:
-        return "5GHz"
-    return ""
-
-
 def _band_from_freq(freq: int) -> str:
     """Derive the band from a centre frequency in MHz."""
     if 2400 <= freq < 2500:
         return "2.4GHz"
-    if 4900 <= freq < 5900:
+    if 4900 <= freq < 5925:
         return "5GHz"
-    if 5900 <= freq <= 7125:
+    if 5925 <= freq <= 7125:
         return "6GHz"
     return ""
 
@@ -820,10 +834,11 @@ def _channel_from_freq(freq: int) -> int:
         return 14
     if 2412 <= freq <= 2472:
         return (freq - 2407) // 5
-    if 5000 <= freq < 5900:
+    if 5000 <= freq < 5925:
         return (freq - 5000) // 5
-    if 5900 <= freq <= 7125:
-        return (freq - 5950) // 5
+    if 5925 <= freq <= 7125:
+        # 6 GHz starts at 5925 MHz but channel 1 is centred on 5955.
+        return max(1, (freq - 5950) // 5)
     return 0
 
 
@@ -834,8 +849,8 @@ def _to_int(value: str) -> int:
 
 
 def _decode_ssid(raw: bytes) -> str:
-    """Decode an SSID element; hidden/empty SSIDs become ''."""
-    return raw.decode("utf-8", "replace").rstrip("\x00") if raw else ""
+    """Decode and sanitize an SSID element; hidden/empty SSIDs become ''."""
+    return sanitize_name(raw.decode("utf-8", "replace")) if raw else ""
 
 
 def _norm_mac(mac: Any) -> str:

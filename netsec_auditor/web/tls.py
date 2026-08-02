@@ -163,11 +163,21 @@ def _build_pinned_context(ver: ssl.TLSVersion) -> ssl.SSLContext | None:
 
 
 async def _handshake(
-    hostname: str, port: int, ctx: ssl.SSLContext, timeout: float
+    hostname: str,
+    port: int,
+    ctx: ssl.SSLContext,
+    timeout: float,
+    connect_host: str | None = None,
 ) -> tuple[str, str] | None:
-    """Attempt a TLS handshake; return (version, cipher) on success else None."""
+    """Attempt a TLS handshake; return (version, cipher) on success else None.
+
+    ``connect_host`` is the scope-validated address to dial; SNI still carries the
+    hostname so a second DNS answer cannot redirect the probe off-scope.
+    """
     try:
-        conn = asyncio.open_connection(hostname, port, ssl=ctx)
+        conn = asyncio.open_connection(
+            connect_host or hostname, port, ssl=ctx, server_hostname=hostname
+        )
         _, writer = await asyncio.wait_for(conn, timeout=timeout)
     except (TimeoutError, ssl.SSLError, OSError):
         return None
@@ -184,7 +194,7 @@ async def _handshake(
 
 
 async def _probe_protocol(
-    hostname: str, port: int, attr: str, timeout: float
+    hostname: str, port: int, attr: str, timeout: float, connect_host: str | None = None
 ) -> bool | None:
     """True if supported, False if refused, None if this client cannot test it."""
     ver = _resolve_version(attr)
@@ -193,7 +203,7 @@ async def _probe_protocol(
     ctx = _build_pinned_context(ver)
     if ctx is None:
         return None  # local OpenSSL will not offer this version
-    result = await _handshake(hostname, port, ctx, timeout)
+    result = await _handshake(hostname, port, ctx, timeout, connect_host)
     if result is None:
         return False  # server refused this version
     negotiated, _ = result
@@ -205,7 +215,9 @@ async def _probe_protocol(
     return True
 
 
-async def _probe_weak_ciphers(hostname: str, port: int, timeout: float) -> str:
+async def _probe_weak_ciphers(
+    hostname: str, port: int, timeout: float, connect_host: str | None = None
+) -> str:
     """Offer only weak ciphers over TLS 1.2; return the negotiated name or ''."""
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.check_hostname = False
@@ -218,21 +230,26 @@ async def _probe_weak_ciphers(hostname: str, port: int, timeout: float) -> str:
         ctx.set_ciphers(_WEAK_CIPHER_SPEC)
     except (ssl.SSLError, ValueError):
         return ""  # local OpenSSL has none of these weak ciphers to offer
-    result = await _handshake(hostname, port, ctx, timeout)
+    result = await _handshake(hostname, port, ctx, timeout, connect_host)
     return result[1] if result is not None else ""
 
 
 async def _probe_default(
-    hostname: str, port: int, timeout: float
+    hostname: str, port: int, timeout: float, connect_host: str | None = None
 ) -> tuple[str, str] | None:
     """Perform a default handshake to record the normally-negotiated params."""
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
-    return await _handshake(hostname, port, ctx, timeout)
+    return await _handshake(hostname, port, ctx, timeout, connect_host)
 
 
-async def scan_tls(hostname: str, port: int = 443, timeout: float = 10.0) -> dict[str, object]:
+async def scan_tls(
+    hostname: str,
+    port: int = 443,
+    timeout: float = 10.0,
+    connect_host: str | None = None,
+) -> dict[str, object]:
     """Scan a host's TLS protocol versions and weak-cipher acceptance.
 
     Returns ``{"protocols": {...}, "weak_ciphers": [...], "findings": [...]}``.
@@ -241,15 +258,15 @@ async def scan_tls(hostname: str, port: int = 443, timeout: float = 10.0) -> dic
     try:
         protocols: dict[str, bool | None] = {}
         for name, attr in _PROTOCOL_ATTRS.items():
-            protocols[name] = await _probe_protocol(hostname, port, attr, timeout)
+            protocols[name] = await _probe_protocol(hostname, port, attr, timeout, connect_host)
 
         findings = classify_protocol_findings(protocols)
 
-        weak_cipher = await _probe_weak_ciphers(hostname, port, timeout)
+        weak_cipher = await _probe_weak_ciphers(hostname, port, timeout, connect_host)
         weak_ciphers = [weak_cipher] if weak_cipher else []
         findings.extend(classify_cipher_findings(weak_ciphers))
 
-        negotiated = await _probe_default(hostname, port, timeout)
+        negotiated = await _probe_default(hostname, port, timeout, connect_host)
         if negotiated is not None:
             version, cipher = negotiated
             findings.append(_finding(

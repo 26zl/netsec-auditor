@@ -8,7 +8,10 @@ through their build/parse building blocks.
 
 from __future__ import annotations
 
+import asyncio
 import struct
+
+import pytest
 
 from netsec_auditor.protocols import ot
 
@@ -19,6 +22,7 @@ def test_build_modbus_request_headers() -> None:
     req = ot.build_modbus_request()
     assert struct.unpack(">H", req[2:4])[0] == 0x0000  # MBAP protocol id
     assert struct.unpack(">H", req[4:6])[0] == 5  # length = unit + 4-byte PDU
+    assert req[6] == 0xFF  # unit id for a device addressed directly over TCP
     assert req[7] == 0x2B  # function code: Read Device Identification
     assert req[8] == 0x0E  # MEI type
     assert req[9] == 0x01  # read device id code = basic
@@ -52,6 +56,25 @@ def test_parse_modbus_rejects_non_modbus() -> None:
     # Protocol id != 0 must be rejected.
     assert ot.parse_modbus_response(struct.pack(">HHHB", 1, 0x0001, 5, 0) + b"\x2b") == {}
     assert ot.parse_modbus_response(b"\x00") == {}
+
+
+def test_parse_modbus_rejects_implausible_length_and_function() -> None:
+    # An all-zero 8-byte reply has MBAP length 0 and must not fingerprint as OT.
+    assert ot.parse_modbus_response(bytes(8)) == {}
+    # Length field claiming more bytes than arrived.
+    assert ot.parse_modbus_response(struct.pack(">HHHB", 1, 0, 99, 0xFF) + b"\x03") == {}
+    # Consistent MBAP but a function code no Modbus device uses.
+    assert ot.parse_modbus_response(struct.pack(">HHHB", 1, 0, 2, 0xFF) + b"\x7f") == {}
+    # Same framing with a real function code is accepted.
+    assert ot.parse_modbus_response(
+        struct.pack(">HHHB", 1, 0, 2, 0xFF) + b"\x04"
+    ) == {"function_code": "0x04"}
+
+
+def test_modbus_frame_length_from_mbap() -> None:
+    req = ot.build_modbus_request()
+    assert ot.modbus_frame_length(req[:3]) is None  # prefix not yet readable
+    assert ot.modbus_frame_length(req) == len(req)
 
 
 # Siemens S7comm
@@ -107,6 +130,74 @@ def test_parse_s7_rejects_garbage() -> None:
     assert ot.parse_s7_szl_response(b"") == {}
 
 
+def test_build_cotp_disconnect_is_a_read_only_teardown() -> None:
+    dr = ot.build_cotp_disconnect()
+    assert dr == b"\x03\x00\x00\x0b" + bytes((0x06, 0x80, 0x00, 0x00, 0x00, 0x01, 0x00))
+    assert dr[0] == 0x03  # TPKT version
+    assert dr[5] == 0x80  # COTP Disconnect Request TPDU type
+
+
+def test_tpkt_frame_length_from_header() -> None:
+    cr = ot.build_s7_cotp_cr()
+    assert ot.tpkt_frame_length(cr[:3]) is None  # length field not yet complete
+    assert ot.tpkt_frame_length(cr) == len(cr)
+
+
+def _fake_s7_stream(
+    monkeypatch: pytest.MonkeyPatch, connection_confirm: bytes
+) -> tuple[list[bytes], list[bool]]:
+    """Patch open_connection with an in-memory peer; returns (sent frames, closed flag)."""
+    sent: list[bytes] = []
+    closed: list[bool] = []
+    replies = [connection_confirm]
+
+    class _Reader:
+        async def read(self, n: int) -> bytes:
+            return replies.pop(0) if replies else b""  # then EOF
+
+    class _Writer:
+        def write(self, data: bytes) -> None:
+            sent.append(data)
+
+        async def drain(self) -> None:
+            return None
+
+        def close(self) -> None:
+            closed.append(True)
+
+        async def wait_closed(self) -> None:
+            return None
+
+    async def fake_open(host: str, port: int) -> tuple[_Reader, _Writer]:
+        return _Reader(), _Writer()
+
+    monkeypatch.setattr(asyncio, "open_connection", fake_open)
+    return sent, closed
+
+
+def test_s7_exchange_sends_cotp_disconnect_before_closing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cc = b"\x03\x00\x00\x0b" + bytes((0x06, 0xD0, 0x00, 0x01, 0x00, 0x02, 0x00))
+    sent, closed = _fake_s7_stream(monkeypatch, cc)
+    cotp_ok, _ = asyncio.run(ot._s7_exchange("10.0.0.1", 102, 0.2))
+    assert cotp_ok is True
+    assert sent[-1] == ot.build_cotp_disconnect()  # slot released, not a bare FIN
+    assert closed == [True]
+
+
+def test_s7_exchange_rejects_reply_without_tpkt_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An unrelated binary service on 102 whose 6th byte happens to look like a CC.
+    not_tpkt = b"\x16\x03\x01\x00\x51\xd0\x00\x01"
+    sent, _ = _fake_s7_stream(monkeypatch, not_tpkt)
+    cotp_ok, szl = asyncio.run(ot._s7_exchange("10.0.0.1", 102, 0.2))
+    assert cotp_ok is False
+    assert szl is None
+    assert ot.build_cotp_disconnect() not in sent  # nothing to disconnect
+
+
 # EtherNet/IP (CIP)
 
 
@@ -157,9 +248,18 @@ def test_parse_enip_rejects_wrong_command() -> None:
 def test_build_bacnet_request() -> None:
     req = ot.build_bacnet_request()
     assert req[0] == 0x81  # BVLC type BACnet/IP
-    assert req[1] == 0x0B  # Original-Broadcast-NPDU
+    assert req[1] == 0x0A  # Original-Unicast-NPDU
     assert struct.unpack(">H", req[2:4])[0] == len(req)  # BVLC length field
     assert req[-2:] == b"\x10\x08"  # Unconfirmed-Request Who-Is APDU
+
+
+def test_bacnet_request_is_not_routed_off_the_target() -> None:
+    # A broadcast Who-Is with a DNET is fanned out by a BBMD to its whole
+    # distribution table, far beyond the host actually being scanned.
+    req = ot.build_bacnet_request()
+    assert req[1] != 0x0B  # not Original-Broadcast-NPDU
+    assert req[5] & 0x20 == 0  # NPDU control: no DNET/DADR present
+    assert b"\xff\xff" not in req  # no global DNET
 
 
 def _bacnet_iam_response(instance: int, vendor: int) -> bytes:
@@ -229,6 +329,53 @@ def test_parse_dnp3_response() -> None:
 
 def test_parse_dnp3_rejects_non_dnp3() -> None:
     assert ot.parse_dnp3_response(b"\x00\x64\x05\xc9\x00\x00\x00\x00") == {}
+
+
+def test_parse_dnp3_rejects_bad_crc() -> None:
+    # Any service whose reply starts 05 64 would otherwise be flagged is_ot.
+    header = struct.pack("<BBBBHH", 0x05, 0x64, 0x05, 0x0B, 4, 1)
+    assert ot.parse_dnp3_response(header + struct.pack("<H", 0x0000)) == {}
+    assert ot.parse_dnp3_response(header + b"\xff\xff") == {}
+    # The same header with the correct CRC is still accepted.
+    good = header + struct.pack("<H", ot.dnp3_crc(header))
+    assert ot.parse_dnp3_response(good)["dnp3"] == "detected"
+
+
+def test_probe_dnp3_tries_several_link_addresses(monkeypatch: pytest.MonkeyPatch) -> None:
+    # An outstation at address 4 discards every other address, so a dst=0-only
+    # probe would time out against it.
+    tried: list[int] = []
+
+    async def fake_tcp(
+        host: str, port: int, payload: bytes, timeout: float, **kwargs: object
+    ) -> bytes | None:
+        dst = struct.unpack("<H", payload[4:6])[0]
+        tried.append(dst)
+        if dst != 4:
+            return None
+        header = struct.pack("<BBBBHH", 0x05, 0x64, 0x05, 0x0B, 0, 4)
+        return header + struct.pack("<H", ot.dnp3_crc(header))
+
+    monkeypatch.setattr(ot, "tcp_request", fake_tcp)
+    result = asyncio.run(ot.probe_dnp3("10.0.0.1", 20000, 0.6))
+    assert result is not None
+    assert result.is_ot is True
+    assert result.device_info["source"] == "4"
+    assert tried == [0, 1, 3, 4]  # stops at the first answer
+
+
+def test_probe_dnp3_splits_the_timeout_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    budget: list[float] = []
+
+    async def fake_tcp(
+        host: str, port: int, payload: bytes, timeout: float, **kwargs: object
+    ) -> bytes | None:
+        budget.append(timeout)
+        return None
+
+    monkeypatch.setattr(ot, "tcp_request", fake_tcp)
+    assert asyncio.run(ot.probe_dnp3("10.0.0.1", 20000, 6.0)) is None
+    assert sum(budget) == pytest.approx(6.0)  # the sweep stays inside the caller's budget
 
 
 # OPC-UA

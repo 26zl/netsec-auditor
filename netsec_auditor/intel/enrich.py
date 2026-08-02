@@ -8,6 +8,7 @@ so they can be unit-tested with crafted payloads.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import time
 from pathlib import Path
@@ -41,7 +42,12 @@ def parse_epss(payload: dict[str, Any]) -> dict[str, dict[str, float]]:
     and returns ``{cve: {"epss": float, "percentile": float}}``.
     """
     scores: dict[str, dict[str, float]] = {}
-    for row in payload.get("data", []):
+    rows = payload.get("data")
+    if not isinstance(rows, list):
+        return scores
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
         cve = row.get("cve")
         if not cve:
             continue
@@ -55,7 +61,12 @@ def parse_epss(payload: dict[str, Any]) -> dict[str, dict[str, float]]:
 def parse_kev(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
     """Map ``cveID`` to its entry from a CISA KEV catalog payload."""
     entries: dict[str, dict[str, Any]] = {}
-    for item in payload.get("vulnerabilities", []):
+    items = payload.get("vulnerabilities")
+    if not isinstance(items, list):
+        return entries
+    for item in items:
+        if not isinstance(item, dict):
+            continue
         cve = item.get("cveID")
         if cve:
             entries[cve] = item
@@ -226,7 +237,18 @@ class InternetDbClient:
         )
 
     async def lookup(self, ip: str) -> dict[str, Any]:
-        """Look up passive exposure data for an IP; empty dict means no data."""
+        """Look up passive exposure data for a public IP; empty dict means no data.
+
+        Private and other non-global addresses are never sent: the lookup would
+        return nothing anyway, and it would disclose the client's internal
+        addressing to a third party.
+        """
+        try:
+            if not ipaddress.ip_address(ip).is_global:
+                logger.debug("internetdb_skipped_non_global", ip=ip)
+                return {}
+        except ValueError:
+            return {}
         try:
             resp = await self._client.get(f"{self.BASE_URL}/{ip}")
             if resp.status_code == 404:

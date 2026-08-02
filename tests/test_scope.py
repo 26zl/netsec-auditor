@@ -109,6 +109,24 @@ def test_unresolvable_target_raises() -> None:
         scope.validate_target("this-host-does-not-exist.invalid")
 
 
+def test_excluded_domain_covers_subdomains(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Excluding a name must also exclude everything beneath it, or an operator who
+    # excluded prod would still scan db.prod.
+    monkeypatch.setattr(
+        "socket.getaddrinfo", lambda *_a, **_k: [(2, 1, 6, "", ("10.0.0.7", 0))]
+    )
+    scope = Scope(
+        name="t",
+        cidr_ranges=["10.0.0.0/24"],
+        domains=["*.example.com"],
+        excluded_domains=["prod.example.com"],
+    )
+    assert scope.validate_target("api.example.com") is True
+    for excluded in ("prod.example.com", "db.prod.example.com", "a.b.prod.example.com"):
+        with pytest.raises(ScopeError):
+            scope.validate_target(excluded)
+
+
 def test_wildcard_domain_matching() -> None:
     # Scope wildcards authorize all subdomains (broad, matches operator intent).
     match = Scope._domain_matches

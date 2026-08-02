@@ -17,20 +17,34 @@ from pathlib import Path
 from defusedxml.common import DefusedXmlException
 from defusedxml.ElementTree import fromstring as safe_fromstring
 
-from netsec_auditor.wireless.base import AccessPoint, assess_access_point
+from netsec_auditor.utils.logging import get_logger
+from netsec_auditor.wireless.base import (
+    AccessPoint,
+    assess_access_point,
+    band_for_channel,
+    sanitize_name,
+)
+
+logger = get_logger(__name__)
 
 # A colon- or dash-separated 48-bit MAC/BSSID.
 _MAC_RE = re.compile(r"(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}")
 
-# Leading XML declaration / DOCTYPE — stripped before parsing (see _parse_xml).
+# Leading XML declaration — stripped before parsing (see _parse_xml).
 _XML_DECL_RE = re.compile(r"<\?xml[^>]*\?>", re.IGNORECASE)
-_DOCTYPE_RE = re.compile(r"<!DOCTYPE[^>]*>", re.IGNORECASE)
+
+# OWE as a whole token, so free-text descriptions ("tower", "power") do not match.
+_OWE_RE = re.compile(r"\bOWE\b")
 
 
 def parse_wigle_csv(text: str) -> list[AccessPoint]:
     """Parse a WiGLE CSV export (pre-header + header + rows). WIFI rows only."""
     aps: list[AccessPoint] = []
-    rows = list(csv.reader(text.splitlines()))
+    try:
+        rows = list(csv.reader(text.splitlines()))
+    except csv.Error as exc:  # e.g. a field beyond csv's 128 KiB limit
+        logger.warning("wardrive_csv_unparsable", error=str(exc))
+        return aps
     header_idx = _find_wigle_header(rows)
     if header_idx < 0:
         return aps
@@ -113,16 +127,16 @@ def _wigle_row_to_ap(header: list[str], raw: list[str]) -> AccessPoint | None:
     channel = _to_int(row.get("CHANNEL", ""))
     ap = AccessPoint(
         bssid=bssid,
-        ssid=row.get("SSID", ""),
+        ssid=sanitize_name(row.get("SSID", "")),
         channel=channel,
-        band=_band_for_channel(channel),
+        band=band_for_channel(channel),
         encryption=enc,
         cipher=cipher,
         auth=auth,
         wps=wps,
         signal_dbm=_to_int(row.get("RSSI", "")),
-        latitude=_to_float(row.get("CURRENTLATITUDE", "")),
-        longitude=_to_float(row.get("CURRENTLONGITUDE", "")),
+        latitude=_to_coord(row.get("CURRENTLATITUDE", ""), 90.0),
+        longitude=_to_coord(row.get("CURRENTLONGITUDE", ""), 180.0),
         source="wigle",
     )
     ap.issues = assess_access_point(ap)
@@ -152,13 +166,13 @@ def _gpx_waypoint_to_ap(wpt: ET.Element) -> AccessPoint | None:
     enc, cipher, auth, wps = _classify_security(meta)
     ap = AccessPoint(
         bssid=bssid,
-        ssid=name,
+        ssid=sanitize_name(name),
         encryption=enc,
         cipher=cipher,
         auth=auth,
         wps=wps,
-        latitude=_to_float(wpt.get("lat")),
-        longitude=_to_float(wpt.get("lon")),
+        latitude=_to_coord(wpt.get("lat"), 90.0),
+        longitude=_to_coord(wpt.get("lon"), 180.0),
         source="gpx",
     )
     ap.issues = assess_access_point(ap)
@@ -180,14 +194,14 @@ def _kismet_network_to_ap(net: ET.Element) -> AccessPoint | None:
         ]
     channel = _to_int(_child_text(net, "channel"))
     gps = _first_child(net, "gps-info")
-    lat = _to_float(_child_text(gps, "avg-lat")) if gps is not None else None
-    lon = _to_float(_child_text(gps, "avg-lon")) if gps is not None else None
+    lat = _to_coord(_child_text(gps, "avg-lat"), 90.0) if gps is not None else None
+    lon = _to_coord(_child_text(gps, "avg-lon"), 180.0) if gps is not None else None
     enc, cipher, auth, wps = _classify_security(" ".join(enc_tokens))
     ap = AccessPoint(
         bssid=bssid,
-        ssid=ssid,
+        ssid=sanitize_name(ssid),
         channel=channel,
-        band=_band_for_channel(channel),
+        band=band_for_channel(channel),
         encryption=enc,
         cipher=cipher,
         auth=auth,
@@ -229,7 +243,9 @@ def _classify_security(raw: str) -> tuple[str, str, str, bool]:
     wps = "WPS" in s
     has_wpa3 = "WPA3" in s or "SAE" in s
     has_wpa2 = "WPA2" in s or "RSN" in s
-    if has_wpa3 and has_wpa2:
+    if _OWE_RE.search(s):
+        encryption = "owe"      # Enhanced Open: encrypted, unauthenticated
+    elif has_wpa3 and has_wpa2:
         encryption = "wpa2/wpa3"
     elif has_wpa3:
         encryption = "wpa3"
@@ -251,6 +267,8 @@ def _classify_security(raw: str) -> tuple[str, str, str, bool]:
     cipher = "+".join(ciphers)
     if "SAE" in s:
         auth = "SAE"
+    elif _OWE_RE.search(s):
+        auth = "OWE"
     elif "EAP" in s:
         auth = "EAP"
     elif "PSK" in s:
@@ -260,20 +278,12 @@ def _classify_security(raw: str) -> tuple[str, str, str, bool]:
     return encryption, cipher, auth, wps
 
 
-def _band_for_channel(channel: int) -> str:
-    """Best-effort 2.4/5 GHz band label from a channel number."""
-    if 1 <= channel <= 14:
-        return "2.4GHz"
-    if 32 <= channel <= 196:
-        return "5GHz"
-    return ""
-
-
 def _parse_xml(text: str) -> ET.Element | None:
     """Parse XML text, stripping any declaration/DOCTYPE; None on failure."""
     cleaned = text.lstrip("\ufeff")  # drop a leading UTF-8 BOM if present
+    # Only the declaration is stripped; fromstring rejects a str carrying an
+    # encoding declaration. The DOCTYPE is left for defusedxml to reject.
     cleaned = _XML_DECL_RE.sub("", cleaned, count=1)
-    cleaned = _DOCTYPE_RE.sub("", cleaned, count=1)
     cleaned = cleaned.strip()
     if not cleaned:
         return None
@@ -323,3 +333,18 @@ def _to_float(value: str | None) -> float | None:
         return float(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
+
+
+def _to_coord(value: str | None, limit: float) -> float | None:
+    """Parse a latitude/longitude, dropping values outside +/- ``limit``.
+
+    An unquoted comma in an SSID shifts every later CSV column, so an
+    out-of-range coordinate means the row is misaligned, not merely odd.
+    """
+    coord = _to_float(value)
+    if coord is None:
+        return None
+    if not -limit <= coord <= limit:
+        logger.debug("wardrive_coordinate_out_of_range", value=value, limit=limit)
+        return None
+    return coord
