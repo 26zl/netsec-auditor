@@ -13,6 +13,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write # create the GitHub Release and attach the artifacts
+    outputs:
+      prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v4
 
@@ -21,9 +23,11 @@ jobs:
           python-version: "3.12"
 
       - name: Verify tag matches package version
+        id: version
         run: |
           python - <<'PY'
           import os
+          import re
           import tomllib
           from pathlib import Path
 
@@ -32,6 +36,10 @@ jobs:
           actual = os.environ["GITHUB_REF_NAME"]
           if actual != expected:
               raise SystemExit(f"tag {actual!r} does not match package version {expected!r}")
+          # A PEP 440 pre-release (1.0.0rc1) goes to TestPyPI; a plain release goes to PyPI.
+          prerelease = bool(re.search(r"(a|b|rc|dev)\d*$", version))
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"prerelease={str(prerelease).lower()}\n")
           PY
 
       - name: Build sdist + wheel
@@ -49,15 +57,43 @@ jobs:
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --generate-notes --verify-tag
+          PRERELEASE: ${{ steps.version.outputs.prerelease }}
+        run: |
+          flags=(--generate-notes --verify-tag)
+          [ "$PRERELEASE" = "true" ] && flags+=(--prerelease)
+          gh release create "$GITHUB_REF_NAME" dist/* "${flags[@]}"
+
+  testpypi-publish:
+    name: publish to TestPyPI
+    needs: build
+    if: needs.build.outputs.prerelease == 'true'
+    runs-on: ubuntu-latest
+    # Trusted Publishing: no API token in the repo. Configure a TestPyPI publisher
+    # for this workflow + the "testpypi" environment at
+    # https://test.pypi.org/manage/account/publishing/
+    environment: testpypi
+    permissions:
+      id-token: write # mint the OIDC token TestPyPI verifies
+    steps:
+      - name: Download dist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to TestPyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
 
   pypi-publish:
     name: publish to PyPI
     needs: build
+    if: needs.build.outputs.prerelease == 'false'
     runs-on: ubuntu-latest
     # Trusted Publishing: no API token in the repo. Configure a PyPI publisher
     # for this workflow + the "pypi" environment at
-    # https://pypi.org/manage/project/netsec-auditor/settings/publishing/
+    # https://pypi.org/manage/account/publishing/
     environment: pypi
     permissions:
       id-token: write # mint the OIDC token PyPI verifies
