@@ -113,9 +113,13 @@ def test_full_rejects_invalid_scan_type() -> None:
 
 def test_full_accepts_scan_type_option() -> None:
     # The option must exist so an unprivileged user can request a connect scan.
-    result = CliRunner().invoke(app, ["full", "--help"])
-    assert result.exit_code == 0
-    assert "--scan-type" in result.output
+    # Introspect the command rather than parse --help, whose width-dependent
+    # wrapping splits the option name under CI's narrow terminal.
+    import typer
+
+    command = typer.main.get_command(app).commands["full"]  # type: ignore[attr-defined]
+    option_names = {name for param in command.params for name in param.opts}
+    assert "--scan-type" in option_names
 
 
 def test_weasyprint_status_reflects_native_library(monkeypatch) -> None:
