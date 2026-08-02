@@ -1323,6 +1323,21 @@ def walk(
     _run_async(_run())
 
 
+def _weasyprint_status() -> tuple[bool | None, str, str]:
+    """Return doctor's (ok, detail, enables) for weasyprint.
+
+    weasyprint fails to import without its GObject/Pango native libraries, so the
+    base library is probed directly instead of importing weasyprint — which prints
+    a banner to a saved stderr handle that cannot be silenced.
+    """
+    import ctypes.util
+
+    enables = "PDF reports"
+    if ctypes.util.find_library("gobject-2.0") is None:
+        return None, "needs Pango/HarfBuzz libs", enables
+    return True, "available", enables
+
+
 @app.command()
 def doctor() -> None:
     """Check the runtime environment and which capabilities are available."""
@@ -1353,10 +1368,16 @@ def doctor() -> None:
         ("scapy", "Wi-Fi monitor, ARP, passive"),
         ("bleak", "BLE recon"),
         ("cryptography", "TLS certificate analysis"),
-        ("weasyprint", "PDF reports"),
     ):
         present = importlib.util.find_spec(module) is not None
         row(module, present, "available" if present else "not installed", enables)
+
+    # weasyprint loads its Pango/HarfBuzz native libs at import, so a findable
+    # module can still be unusable; report what it can actually do.
+    if importlib.util.find_spec("weasyprint") is None:
+        row("weasyprint", False, "not installed", "PDF reports")
+    else:
+        row("weasyprint", *_weasyprint_status())
 
     wifi_tool = next(
         (t for t in ("nmcli", "iw", "system_profiler") if shutil.which(t)), None

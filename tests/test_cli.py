@@ -116,3 +116,19 @@ def test_full_accepts_scan_type_option() -> None:
     result = CliRunner().invoke(app, ["full", "--help"])
     assert result.exit_code == 0
     assert "--scan-type" in result.output
+
+
+def test_weasyprint_status_reflects_native_library(monkeypatch) -> None:
+    # doctor must report weasyprint unusable when the GObject/Pango libs are
+    # missing, not merely because the Python module is importable.
+    from netsec_auditor import cli
+
+    monkeypatch.setattr("ctypes.util.find_library", lambda _name: None)
+    ok, detail, _ = cli._weasyprint_status()
+    assert ok is None
+    assert "Pango" in detail
+
+    monkeypatch.setattr("ctypes.util.find_library", lambda _name: "/usr/lib/libgobject-2.0.so")
+    ok, detail, _ = cli._weasyprint_status()
+    assert ok is True
+    assert detail == "available"
