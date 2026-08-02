@@ -2,10 +2,11 @@
 #
 # netsec-auditor installer.
 #
-# Installs the `netsec-auditor` CLI, preferring pipx (isolated, PEP 668-safe)
-# and falling back to `pip install --user`. Idempotent: safe to re-run to
-# upgrade. Also checks for the `nmap` runtime dependency and prints an
-# OS-specific install hint if it is missing.
+# Installs the `netsec-auditor` CLI from the Git repository (it is not on PyPI),
+# preferring pipx (isolated, PEP 668-safe) and falling back to
+# `pip install --user`. Idempotent: safe to re-run to upgrade. Also checks for
+# the `nmap` runtime dependency and prints an OS-specific install hint if it is
+# missing.
 #
 # Usage:
 #   ./scripts/install.sh
@@ -13,7 +14,7 @@
 #
 set -euo pipefail
 
-PACKAGE="netsec-auditor"
+PACKAGE="git+https://github.com/26zl/netsec-auditor.git"
 BINARY="netsec-auditor"
 
 info() { printf '\033[0;34m==>\033[0m %s\n' "$1"; }
@@ -48,10 +49,11 @@ check_nmap() {
 
 install_with_pipx() {
   info "Installing ${PACKAGE} with pipx (isolated)..."
-  # pipx install fails if it is already installed; upgrade in that case.
+  # pipx install fails if it is already installed. "pipx upgrade" takes a package
+  # name rather than a URL, so reinstall to pick up the newer revision.
   if ! pipx install "${PACKAGE}"; then
-    info "${PACKAGE} already installed via pipx — upgrading..."
-    pipx upgrade "${PACKAGE}"
+    info "already installed via pipx — reinstalling to upgrade..."
+    pipx install --force "${PACKAGE}"
   fi
   pipx ensurepath >/dev/null 2>&1 || true
 }
@@ -66,7 +68,7 @@ install_with_pip() {
     err "pip install failed."
     err "On Debian / Kali / NetHunter the system Python is externally managed."
     err "Install pipx and retry:"
-    printf '        %s\n' "sudo apt-get install -y pipx && pipx install ${PACKAGE}" >&2
+    printf '        %s\n' "sudo apt-get install -y pipx && pipx install '${PACKAGE}'" >&2
     exit 1
   fi
 }

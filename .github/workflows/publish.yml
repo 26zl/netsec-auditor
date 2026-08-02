@@ -36,7 +36,7 @@ jobs:
           actual = os.environ["GITHUB_REF_NAME"]
           if actual != expected:
               raise SystemExit(f"tag {actual!r} does not match package version {expected!r}")
-          # A PEP 440 pre-release (1.0.0rc1) goes to TestPyPI; a plain release goes to PyPI.
+          # A PEP 440 pre-release (1.0.0rc1) is marked as such on the GitHub Release.
           prerelease = bool(re.search(r"(a|b|rc|dev)\d*$", version))
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
               fh.write(f"prerelease={str(prerelease).lower()}\n")
@@ -62,47 +62,3 @@ jobs:
           flags=(--generate-notes --verify-tag)
           [ "$PRERELEASE" = "true" ] && flags+=(--prerelease)
           gh release create "$GITHUB_REF_NAME" dist/* "${flags[@]}"
-
-  testpypi-publish:
-    name: publish to TestPyPI
-    needs: build
-    if: needs.build.outputs.prerelease == 'true'
-    runs-on: ubuntu-latest
-    # Trusted Publishing: no API token in the repo. Configure a TestPyPI publisher
-    # for this workflow + the "testpypi" environment at
-    # https://test.pypi.org/manage/account/publishing/
-    environment: testpypi
-    permissions:
-      id-token: write # mint the OIDC token TestPyPI verifies
-    steps:
-      - name: Download dist artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: dist
-          path: dist/
-
-      - name: Publish to TestPyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          repository-url: https://test.pypi.org/legacy/
-
-  pypi-publish:
-    name: publish to PyPI
-    needs: build
-    if: needs.build.outputs.prerelease == 'false'
-    runs-on: ubuntu-latest
-    # Trusted Publishing: no API token in the repo. Configure a PyPI publisher
-    # for this workflow + the "pypi" environment at
-    # https://pypi.org/manage/account/publishing/
-    environment: pypi
-    permissions:
-      id-token: write # mint the OIDC token PyPI verifies
-    steps:
-      - name: Download dist artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: dist
-          path: dist/
-
-      - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1

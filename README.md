@@ -96,29 +96,33 @@ external monitor-mode adapter is only needed for frame-level passive capture
 
 ## Installation
 
-Version 1.0.0 has not yet been published to PyPI or GHCR, so the source install
-below is currently the only installation path.
+```bash
+pipx install git+https://github.com/26zl/netsec-auditor.git
+```
+
+That is the whole install. It is not on PyPI — installing straight from the
+repository keeps one source of truth and means a release is just a tag.
 
 ```bash
-# From source
+# With the optional extras (BLE + PDF)
+pipx install "netsec-auditor[all] @ git+https://github.com/26zl/netsec-auditor.git"
+
+# Pin to a released version
+pipx install git+https://github.com/26zl/netsec-auditor.git@v1.0.0
+
+# From a checkout
 pip install .
 pip install -e ".[dev]"        # for development
-pipx install .                  # isolated CLI install
-pipx install ".[all]"          # BLE + PDF extras
 
 # Local Docker image (nmap bundled)
 docker build -t netsec-auditor:local .
 docker run --rm --net=host netsec-auditor:local scan 10.0.0.5 --scan-type connect
 ```
 
-After the release workflow has published version 1.0.0, the package installer
-can be used with `pipx install netsec-auditor` (or `netsec-auditor[all]`). The
-one-line installer in `scripts/install.sh` also expects that PyPI release.
+Every [release](https://github.com/26zl/netsec-auditor/releases) also carries a
+built wheel and sdist if you would rather install the artifact directly.
 
-```bash
-# Release install (not available until version 1.0.0 is published)
-pipx install netsec-auditor
-```
+`scripts/install.sh` wraps the same command and adds an `nmap` check.
 
 ## Usage
 

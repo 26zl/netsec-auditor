@@ -73,8 +73,8 @@ jobs:
 
       - uses: astral-sh/setup-uv@v5
 
-      # The matrix installs with pip (the path users get from PyPI); this job
-      # exists so the committed lockfile cannot silently drift from pyproject.
+      # The matrix installs with pip (the path users get); this job exists so the
+      # committed lockfile cannot silently drift from pyproject.
       - name: Verify the lockfile resolves
         run: uv sync --frozen --all-extras
 
