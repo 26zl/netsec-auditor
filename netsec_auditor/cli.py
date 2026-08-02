@@ -543,6 +543,13 @@ def full(
         str,
         typer.Option("--ports", "-p", help="Ports to scan"),
     ] = "common",
+    scan_type: Annotated[
+        str,
+        typer.Option(
+            "--scan-type", "-t",
+            help="Scan type: syn, connect, udp (syn/udp need root; auto-connect otherwise)",
+        ),
+    ] = "syn",
     web_scan: Annotated[
         bool,
         typer.Option("--web/--no-web", help="Include the device web-interface audit"),
@@ -577,6 +584,8 @@ def full(
     port_list = _parse_ports(ports)
     if concurrency < 1:
         raise typer.BadParameter("concurrency must be at least one")
+    if scan_type.lower() not in {"syn", "connect", "udp"}:
+        raise typer.BadParameter("scan type must be one of: syn, connect, udp")
 
     scan_targets: list[str] = []
     explicit_web_urls: list[str] = []
@@ -609,11 +618,22 @@ def full(
 
     async def _run() -> None:
         console.print("\n[bold]Phase 1/4: Network Discovery & Port Scanning[/bold]")
+        # SYN/UDP scans and OS detection need root; fall back to a connect scan so
+        # the audit still runs unprivileged instead of failing with "requires root".
+        effective_scan_type = scan_type.lower()
+        os_detection = is_privileged()
+        if effective_scan_type in ("syn", "udp") and not is_privileged():
+            console.print(
+                "[yellow]Not root — using a TCP connect scan "
+                "(SYN/UDP and OS detection require root).[/yellow]"
+            )
+            effective_scan_type = "connect"
         scan_result = await scanner.scan_network(
             targets=scan_targets,
             ports=port_list,
+            scan_type=effective_scan_type,
             service_detection=True,
-            os_detection=True,
+            os_detection=os_detection,
             concurrency=concurrency,
         )
         _display_scan_results(scan_result)

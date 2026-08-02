@@ -104,3 +104,15 @@ def test_web_reports_when_no_targets_could_be_audited() -> None:
     result = CliRunner().invoke(app, ["web", "http://127.0.0.1:99999"])
     assert result.exit_code == 0
     assert "No web interfaces could be audited" in result.output
+
+
+def test_full_rejects_invalid_scan_type() -> None:
+    result = CliRunner().invoke(app, ["full", "127.0.0.1", "--scan-type", "bogus"])
+    assert result.exit_code != 0
+
+
+def test_full_accepts_scan_type_option() -> None:
+    # The option must exist so an unprivileged user can request a connect scan.
+    result = CliRunner().invoke(app, ["full", "--help"])
+    assert result.exit_code == 0
+    assert "--scan-type" in result.output
