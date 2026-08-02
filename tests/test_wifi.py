@@ -335,6 +335,45 @@ def test_parse_airport_json_without_bssid_leaves_bssid_empty() -> None:
     assert aps[0].key == "ssid:NoBssidNet"  # de-duplicated by SSID instead
 
 
+def test_parse_airport_json_redacted_ssid_is_not_a_real_name() -> None:
+    # macOS returns the literal "<redacted>" when it withholds the SSID; it must
+    # not be reported as the network name, and two distinct redacted networks
+    # must not collapse into one row.
+    def net(security: str, channel: str, signal: str) -> dict:
+        return {
+            "_name": "<redacted>",
+            "spairport_security_mode": security,
+            "spairport_network_channel": channel,
+            "spairport_signal_noise": signal,
+        }
+
+    data = {
+        "SPAirPortDataType": [
+            {
+                "spairport_airport_interfaces": [
+                    {
+                        "spairport_current_network_information": net(
+                            "spairport_security_mode_wpa3_personal", "2 (2GHz)", "-67 dBm"
+                        ),
+                        "spairport_airport_other_local_wireless_networks": [
+                            net("spairport_security_mode_wpa2_personal", "36 (5GHz)", "-71 dBm"),
+                        ],
+                    }
+                ]
+            }
+        ]
+    }
+    aps = parse_airport_json(data)
+    assert all(ap.ssid == "" for ap in aps)  # placeholder not shown as a name
+    inventory = WirelessInventory()
+    for ap in aps:
+        inventory.add_ap(ap)
+    rows = inventory.aps()
+    assert len(rows) == 2  # WPA3/ch2 and WPA2/ch36 stay distinct
+    assert {r.encryption for r in rows} == {"wpa2", "wpa3"}
+    assert all(r.signal_dbm for r in rows)  # signal preserved for the operator
+
+
 def test_parse_airport_json_sanitizes_ssid_markup_and_control_characters() -> None:
     data = {
         "SPAirPortDataType": [

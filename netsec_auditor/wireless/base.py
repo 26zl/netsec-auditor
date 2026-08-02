@@ -63,8 +63,16 @@ class AccessPoint:
 
     @property
     def key(self) -> str:
-        """De-duplication key: the BSSID when known, otherwise the SSID."""
-        return self.bssid.upper() if self.bssid else f"ssid:{self.ssid}"
+        """De-duplication key: BSSID, else SSID, else channel+encryption.
+
+        The last fallback keeps two identifier-less APs (macOS hides both the
+        BSSID and the SSID without location permission) from collapsing into one.
+        """
+        if self.bssid:
+            return self.bssid.upper()
+        if self.ssid:
+            return f"ssid:{self.ssid}"
+        return f"anon:{self.channel}:{self.encryption}"
 
     def to_dict(self) -> dict[str, Any]:
         return {

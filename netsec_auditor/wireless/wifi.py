@@ -84,6 +84,9 @@ _NMCLI_ARGV = [
     "nmcli", "-t", "-f", ",".join(_NMCLI_FIELDS), "dev", "wifi", "list", "--rescan", "no",
 ]
 
+# Placeholders macOS substitutes for a withheld SSID (no location permission).
+_MACOS_SSID_PLACEHOLDERS = frozenset({"<redacted>", "<private>", "<unknown ssid>"})
+
 _MAC_RE = re.compile(r"^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$")
 _IW_BSS_RE = re.compile(r"^BSS\s+([0-9a-fA-F:]{17})")
 
@@ -640,19 +643,27 @@ def _ap_from_airport_net(net: Any) -> AccessPoint | None:
     if not isinstance(net, dict):
         return None
     name = sanitize_name(net.get("_name", ""))
+    # macOS returns a literal placeholder (e.g. "<redacted>") for the SSID without
+    # location permission; treat it as unknown rather than a real network name.
+    if name.lower() in _MACOS_SSID_PLACEHOLDERS:
+        name = ""
     # Recent macOS omits the BSSID without location permission; it stays empty
     # rather than being filled with the SSID, which would defeat evil-twin
     # detection and mislabel the reported BSSID.
     bssid = str(net.get("spairport_network_bssid", "") or "").upper()
-    if not bssid and not name:
+    channel_raw = str(net.get("spairport_network_channel", "") or "")
+    channel = _to_int(channel_raw)
+    signal = _airport_signal(net.get("spairport_signal_noise", ""))
+    sec = _airport_security(str(net.get("spairport_security_mode", "") or ""))
+    # Drop only a network with no identifier and nothing else worth reporting; a
+    # macOS-hidden AP still tells the operator its encryption and signal.
+    if not bssid and not name and sec["encryption"] == "open" and not signal:
         return None
     ap = AccessPoint(bssid=bssid, source="scan")
     ap.ssid = name
-    channel_raw = str(net.get("spairport_network_channel", "") or "")
-    ap.channel = _to_int(channel_raw)
+    ap.channel = channel
     ap.band = _airport_band(channel_raw) or band_for_channel(ap.channel)
-    ap.signal_dbm = _airport_signal(net.get("spairport_signal_noise", ""))
-    sec = _airport_security(str(net.get("spairport_security_mode", "") or ""))
+    ap.signal_dbm = signal
     ap.encryption = sec["encryption"]
     ap.cipher = sec["cipher"]
     ap.auth = sec["auth"]
