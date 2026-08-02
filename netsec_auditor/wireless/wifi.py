@@ -26,6 +26,7 @@ import contextlib
 import importlib.util
 import json
 import os
+import platform
 import re
 import shutil
 from typing import Any
@@ -110,7 +111,7 @@ async def scan_wifi(
     """
     inventory = WirelessInventory()
 
-    if use_scapy and _scapy_available() and _is_root():
+    if use_scapy and _monitor_mode_supported() and _scapy_available() and _is_root():
         try:
             await _scan_with_scapy(inventory, iface, duration)
         except Exception as exc:  # a capture error must not crash the caller
@@ -903,3 +904,13 @@ def _scapy_available() -> bool:
         return importlib.util.find_spec("scapy") is not None
     except (ImportError, ValueError):
         return False
+
+
+def _monitor_mode_supported() -> bool:
+    """False on platforms where scapy cannot capture in monitor mode.
+
+    scapy has no monitor-mode support over macOS BPF; attempting it there only
+    imports scapy, wastes the capture window, and leaves a socket whose failed
+    finalizer prints a traceback — so macOS uses the OS scan tools directly.
+    """
+    return platform.system() != "Darwin"

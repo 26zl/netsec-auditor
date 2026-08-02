@@ -478,3 +478,20 @@ async def test_scan_wifi_no_tools_returns_empty(monkeypatch) -> None:
     inventory = await scan_wifi(iface=None, duration=0.0, use_scapy=False)
     assert isinstance(inventory, WirelessInventory)
     assert inventory.aps() == []
+
+
+async def test_scan_wifi_skips_scapy_monitor_mode_on_macos(monkeypatch) -> None:
+    # scapy cannot capture in monitor mode over macOS BPF; attempting it there
+    # only wastes the window and leaves a failed socket that prints a traceback.
+    monkeypatch.setattr("netsec_auditor.wireless.wifi.platform.system", lambda: "Darwin")
+    monkeypatch.setattr("netsec_auditor.wireless.wifi._is_root", lambda: True)
+    monkeypatch.setattr("netsec_auditor.wireless.wifi._scapy_available", lambda: True)
+
+    def _fail_scapy(*_args: object) -> None:
+        raise AssertionError("scapy monitor mode must not be attempted on macOS")
+
+    monkeypatch.setattr("netsec_auditor.wireless.wifi._scan_with_scapy", _fail_scapy)
+    monkeypatch.setattr("netsec_auditor.wireless.wifi.shutil.which", lambda _: None)
+
+    inventory = await scan_wifi(iface=None, duration=0.0)
+    assert inventory.aps() == []
