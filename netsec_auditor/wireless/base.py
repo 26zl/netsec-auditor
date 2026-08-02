@@ -63,16 +63,12 @@ class AccessPoint:
 
     @property
     def key(self) -> str:
-        """De-duplication key: BSSID, else SSID, else channel+encryption.
+        """De-duplication key: the BSSID when known, otherwise the SSID.
 
-        The last fallback keeps two identifier-less APs (macOS hides both the
-        BSSID and the SSID without location permission) from collapsing into one.
+        An AP with neither is anonymous and is not de-duplicated at all (see
+        :meth:`WirelessInventory.add_ap`), so it never reaches this fallback.
         """
-        if self.bssid:
-            return self.bssid.upper()
-        if self.ssid:
-            return f"ssid:{self.ssid}"
-        return f"anon:{self.channel}:{self.encryption}"
+        return self.bssid.upper() if self.bssid else f"ssid:{self.ssid}"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -126,8 +122,16 @@ class WirelessInventory:
 
     access_points: dict[str, AccessPoint] = field(default_factory=dict)
     ble_devices: dict[str, BleDevice] = field(default_factory=dict)
+    _anon_seq: int = field(default=0, repr=False)
 
     def add_ap(self, ap: AccessPoint) -> None:
+        if not ap.bssid and not ap.ssid:
+            # No stable identifier — macOS withholds both the BSSID and the SSID
+            # without location permission. Keep every reported network instead of
+            # merging distinct ones that merely share a channel and encryption.
+            self.access_points[f"anon:{self._anon_seq}"] = ap
+            self._anon_seq += 1
+            return
         existing = self.access_points.get(ap.key)
         if existing is None:
             self.access_points[ap.key] = ap

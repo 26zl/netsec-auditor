@@ -150,3 +150,23 @@ def test_assess_ble_device_unknown_connectable_is_not_flagged() -> None:
     dev = BleDevice(address="DE:AD:BE:EF:00:02", name="", services=[])
     assert dev.connectable is None
     assert assess_ble_device(dev) == []
+
+
+def test_anonymous_aps_are_not_merged_by_channel_and_encryption() -> None:
+    # macOS hides both BSSID and SSID; two distinct neighbours that share a
+    # channel and encryption must stay two rows, not collapse into one.
+    inv = WirelessInventory()
+    for _ in range(3):
+        ap = AccessPoint(bssid="", ssid="", channel=6, encryption="wpa2")
+        ap.issues = assess_access_point(ap)
+        inv.add_ap(ap)
+    assert len(inv.aps()) == 3
+
+
+def test_identified_aps_still_deduplicate_by_bssid() -> None:
+    inv = WirelessInventory()
+    inv.add_ap(AccessPoint(bssid="AA:BB:CC:11:22:33", ssid="Home", signal_dbm=-70))
+    inv.add_ap(AccessPoint(bssid="AA:BB:CC:11:22:33", ssid="Home", signal_dbm=-55))
+    rows = inv.aps()
+    assert len(rows) == 1
+    assert rows[0].signal_dbm == -55  # strongest sighting wins
