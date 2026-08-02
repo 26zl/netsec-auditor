@@ -506,8 +506,14 @@ def web(
         )
         for result in results:
             _display_web_result(result)
+        if not results:
+            console.print(
+                "[yellow]No web interfaces could be audited — every target was "
+                "unreachable, invalid, or out of scope. Re-run with '-v' for "
+                "per-target detail.[/yellow]"
+            )
 
-        if output:
+        if output and results:
             report_gen = ReportGenerator(output_dir=output)
             paths = report_gen.generate_all(
                 web_results=results,
@@ -644,6 +650,8 @@ def full(
             )
             for result in web_results:
                 _display_web_result(result)
+            if not web_results:
+                console.print("[yellow]No web interfaces responded.[/yellow]")
 
         console.print("\n[bold]Phase 4/4: OT/IoT Device Identification[/bold]")
         identified = []

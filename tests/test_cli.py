@@ -97,3 +97,10 @@ def test_display_escapes_attacker_controlled_names(capsys) -> None:
 
     assert "[link=" in out or "[link…" in out or "[link" in out
     assert "[blink]y[/blink]" in out
+
+
+def test_web_reports_when_no_targets_could_be_audited() -> None:
+    # An unusable target (invalid port) must not exit silently with just a banner.
+    result = CliRunner().invoke(app, ["web", "http://127.0.0.1:99999"])
+    assert result.exit_code == 0
+    assert "No web interfaces could be audited" in result.output
