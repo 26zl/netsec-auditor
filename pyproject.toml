@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "netsec-auditor"
-version = "1.0.4"
+version = "1.0.5"
 description = "Network Security Auditor — authorized infrastructure security scanning and penetration testing toolkit"
 readme = "README.md"
 license = "MIT"

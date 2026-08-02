@@ -118,3 +118,15 @@ def test_scan_tls_is_async_and_importable() -> None:
     assert sig.parameters["timeout"].default == 10.0
     # None means "dial the hostname"; callers pass a scope-validated IP to pin it.
     assert sig.parameters["connect_host"].default is None
+
+
+async def test_scan_tls_reports_nothing_when_no_service_is_reachable(monkeypatch) -> None:
+    # A closed port makes every handshake fail; that must not be reported as
+    # "TLS 1.3 not supported" — there is no TLS service on that port to assess.
+    async def _no_handshake(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr("netsec_auditor.web.tls._handshake", _no_handshake)
+    result = await scan_tls("192.0.2.1", 443, timeout=0.1)
+    assert result["findings"] == []
+    assert result["protocols"] == {}

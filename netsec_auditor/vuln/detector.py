@@ -491,9 +491,14 @@ class CVEQueryClient:
             published = cve.get("published", "")
             modified = cve.get("lastModified", "")
 
-            references = [
-                ref.get("url", "") for ref in cve.get("references", [])
-            ]
+            # NVD lists a URL once per reference tag, so dedupe while preserving order.
+            references = list(
+                dict.fromkeys(
+                    url
+                    for ref in cve.get("references", [])
+                    if (url := ref.get("url", ""))
+                )
+            )
 
             results.append({
                 "cve_id": cve_id,

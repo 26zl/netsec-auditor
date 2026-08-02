@@ -260,13 +260,21 @@ async def scan_tls(
         for name, attr in _PROTOCOL_ATTRS.items():
             protocols[name] = await _probe_protocol(hostname, port, attr, timeout, connect_host)
 
+        negotiated = await _probe_default(hostname, port, timeout, connect_host)
+        # A refused TLS version and a closed port both present as a failed
+        # handshake, so posture is only assessed once a TLS service is confirmed
+        # reachable — otherwise a host with nothing on this port would be reported
+        # as "TLS 1.3 not supported".
+        if negotiated is None and not any(v is True for v in protocols.values()):
+            logger.debug("tls_no_service", hostname=hostname, port=port)
+            return {"protocols": {}, "weak_ciphers": [], "findings": []}
+
         findings = classify_protocol_findings(protocols)
 
         weak_cipher = await _probe_weak_ciphers(hostname, port, timeout, connect_host)
         weak_ciphers = [weak_cipher] if weak_cipher else []
         findings.extend(classify_cipher_findings(weak_ciphers))
 
-        negotiated = await _probe_default(hostname, port, timeout, connect_host)
         if negotiated is not None:
             version, cipher = negotiated
             findings.append(_finding(
