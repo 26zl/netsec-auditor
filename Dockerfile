@@ -2,7 +2,7 @@
 
 # Resolve and install the project + its dependencies into an isolated prefix.
 # Kept in a separate stage so build tools never reach the final image.
-FROM python:3.12-slim AS builder
+FROM python:3.13-slim AS builder
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -19,7 +19,7 @@ WORKDIR /src
 COPY . .
 RUN pip install --prefix=/install .
 
-FROM python:3.12-slim
+FROM python:3.13-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
