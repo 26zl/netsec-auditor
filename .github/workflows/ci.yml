@@ -71,7 +71,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v7
 
       # The matrix installs with pip (the path users get); this job exists so the
       # committed lockfile cannot silently drift from pyproject.
