@@ -220,7 +220,9 @@ def scan(
     """Run a network port scan against authorized targets."""
     scope = _load_scope(scope_file, targets)
 
-    port_list = _parse_ports(ports)
+    # Always probe OT/ICS ports so the engine's OT safety interlock engages and
+    # fragile devices are scanned read-only rather than with aggressive defaults.
+    port_list = sorted(set(_parse_ports(ports)) | OT_PORTS)
     report_format = format.lower()
     if report_format not in {"json", "html", "pdf", "all", "none"}:
         raise typer.BadParameter("format must be one of: json, html, pdf, all, none")
@@ -550,6 +552,13 @@ def full(
             help="Scan type: syn, connect, udp (syn/udp need root; auto-connect otherwise)",
         ),
     ] = "syn",
+    os_detection: Annotated[
+        bool,
+        typer.Option(
+            "--os-detection/--no-os-detection",
+            help="Enable OS fingerprinting (-O; needs root, suppressed on OT-sensitive scans)",
+        ),
+    ] = False,
     web_scan: Annotated[
         bool,
         typer.Option("--web/--no-web", help="Include the device web-interface audit"),
@@ -581,7 +590,9 @@ def full(
 ) -> None:
     """Run a full security audit — network scan, vulnerability assessment, and web scan."""
     scope = _load_scope(scope_file, targets)
-    port_list = _parse_ports(ports)
+    # Always probe OT/ICS ports so the engine's OT safety interlock engages and
+    # fragile devices are scanned read-only rather than with aggressive defaults.
+    port_list = sorted(set(_parse_ports(ports)) | OT_PORTS)
     if concurrency < 1:
         raise typer.BadParameter("concurrency must be at least one")
     if scan_type.lower() not in {"syn", "connect", "udp"}:
@@ -621,19 +632,23 @@ def full(
         # SYN/UDP scans and OS detection need root; fall back to a connect scan so
         # the audit still runs unprivileged instead of failing with "requires root".
         effective_scan_type = scan_type.lower()
-        os_detection = is_privileged()
+        os_detect = os_detection and is_privileged()
         if effective_scan_type in ("syn", "udp") and not is_privileged():
             console.print(
                 "[yellow]Not root — using a TCP connect scan "
                 "(SYN/UDP and OS detection require root).[/yellow]"
             )
             effective_scan_type = "connect"
+        if os_detection and not is_privileged():
+            console.print(
+                "[yellow]OS detection (-O) requires root — continuing without it.[/yellow]"
+            )
         scan_result = await scanner.scan_network(
             targets=scan_targets,
             ports=port_list,
             scan_type=effective_scan_type,
             service_detection=True,
-            os_detection=os_detection,
+            os_detection=os_detect,
             concurrency=concurrency,
         )
         _display_scan_results(scan_result)
