@@ -331,6 +331,8 @@ class PortScanner:
         port_str = ",".join(str(p) for p in ports)
         scan_flag = {"syn": "-sS", "connect": "-sT", "udp": "-sU"}[scan_type]
         arguments = f"{scan_flag} -T{timing_template} --max-retries {self.max_retries}"
+        if self.scope.max_scan_rate > 0:
+            arguments += f" --max-rate {self.scope.max_scan_rate}"
 
         if service_detection:
             arguments += f" -sV --version-intensity {version_intensity}"
@@ -378,13 +380,17 @@ class PortScanner:
         scan_units: list[str] = []
         total_addresses = 0
         for target in targets:
-            self.scope.validate_target(target)
             host = self.scope._extract_host(target)
             if "/" in host:
+                self.scope.validate_target(target)
                 total_addresses += ipaddress.ip_network(host, strict=False).num_addresses
+                scan_units.append(host)
             else:
-                total_addresses += 1
-            scan_units.append(host)
+                # Hand nmap the scope-validated IPs rather than the hostname so it
+                # cannot re-resolve to an out-of-scope address after the scope check.
+                for ip in self.scope.resolve_in_scope(target):
+                    total_addresses += 1
+                    scan_units.append(str(ip))
             if total_addresses > MAX_EXPANDED_TARGETS:
                 raise TargetLimitError(
                     f"Scan spans more than the safe limit of {MAX_EXPANDED_TARGETS:,} addresses"
