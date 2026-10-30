@@ -28,7 +28,8 @@ workflow builds the wheel and sdist and attaches them to a
 
 - `uv.lock`: Pillow 13.0.0, virtualenv 21.15.2, filelock 4.2.5, certifi
   2026.10.23, Brotli 1.2.1 and brotlicffi 1.2.1.0, clearing the open
-  Dependabot alerts. These are development and `pdf`-extra dependencies; the
+  Dependabot alerts. certifi is a runtime dependency (via httpx); the others
+  come from the `pdf` and `dev` extras. Only the lockfile changes; the
   published wheel keeps the version ranges in `pyproject.toml`.
 - Earlier lockfile bumps on `main`: cryptography (#11), soupsieve and
   weasyprint (#12), virtualenv (#13).
