@@ -2,6 +2,7 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 permissions:
@@ -60,7 +61,7 @@ jobs:
       # Fails the build on a dependency with a known advisory. Kept separate from
       # the test matrix so a new CVE is reported once, not three times.
       - name: Audit dependencies (pip-audit)
-        uses: pypa/gh-action-pip-audit@v1.1.0
+        uses: pypa/gh-action-pip-audit@1220774d901786e6f652ae159f7b6bc8fea6d266 # v1.1.0
         with:
           inputs: .
 
@@ -71,7 +72,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: astral-sh/setup-uv@v7
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
 
       # The matrix installs with pip (the path users get); this job exists so the
       # committed lockfile cannot silently drift from pyproject.
@@ -88,7 +89,7 @@ jobs:
       # The README documents a local image build; without this the Dockerfile can
       # break silently since nothing else exercises it.
       - name: Build image
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           push: false
