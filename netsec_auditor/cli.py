@@ -1568,13 +1568,16 @@ async def _scan_web_targets(
 
     async def _one(target: str) -> Any | None:
         schemes = ("",) if "://" in target else ("https://", "http://")
+        result = None
         async with semaphore:
             for scheme in schemes:
                 try:
-                    return await scanner.scan(f"{scheme}{target}", deep=deep)
+                    result = await scanner.scan(f"{scheme}{target}", deep=deep)
+                    if result.reachable or scheme != "https://":
+                        return result
                 except (ScopeError, ValueError) as exc:
                     logger.debug("web_scan_skipped", target=target, error=str(exc))
-        return None
+        return result
 
     return [r for r in await asyncio.gather(*(_one(t) for t in targets)) if r is not None]
 

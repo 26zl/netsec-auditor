@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import stat
+from unittest.mock import AsyncMock
 
 import pytest
 import typer
 import yaml
 from typer.testing import CliRunner
 
-from netsec_auditor.cli import _write_scope_file, app
-from netsec_auditor.scanner.scope import Scope
+from netsec_auditor.cli import _scan_web_targets, _write_scope_file, app
+from netsec_auditor.scanner.scope import Scope, ScopeError
+from netsec_auditor.web.scanner import WebScanResult
 
 
 def _scope() -> Scope:
@@ -104,6 +106,57 @@ def test_web_reports_when_no_targets_could_be_audited() -> None:
     result = CliRunner().invoke(app, ["web", "http://127.0.0.1:99999"])
     assert result.exit_code == 0
     assert "No web interfaces could be audited" in result.output
+
+
+@pytest.mark.parametrize(
+    ("target", "outcomes", "expected_urls", "expected_index"),
+    [
+        ("device.example.test", [True], ["https://device.example.test"], 0),
+        (
+            "device.example.test", [False, True],
+            ["https://device.example.test", "http://device.example.test"], 1,
+        ),
+        (
+            "https://device.example.test", [False],
+            ["https://device.example.test"], 0,
+        ),
+        ("http://device.example.test", [False], ["http://device.example.test"], 0),
+        (
+            "device.example.test", [False, False],
+            ["https://device.example.test", "http://device.example.test"], 1,
+        ),
+        (
+            "device.example.test", [ScopeError("Out of scope"), True],
+            ["https://device.example.test", "http://device.example.test"], 1,
+        ),
+        (
+            "device.example.test", [False, ScopeError("Out of scope")],
+            ["https://device.example.test", "http://device.example.test"], 0,
+        ),
+        (
+            "device.example.test", [ScopeError("Out of scope"), ScopeError("Out of scope")],
+            ["https://device.example.test", "http://device.example.test"], None,
+        ),
+        (
+            "https://device.example.test", [ScopeError("Out of scope")],
+            ["https://device.example.test"], None,
+        ),
+    ],
+)
+async def test_web_protocol_fallback(target, outcomes, expected_urls, expected_index) -> None:
+    responses = [
+        outcome if isinstance(outcome, Exception) else WebScanResult(url=url, reachable=outcome)
+        for url, outcome in zip(expected_urls, outcomes, strict=True)
+    ]
+    scanner = AsyncMock()
+    scanner.scan.side_effect = responses
+
+    results = await _scan_web_targets(scanner, [target], deep=True, concurrency=1)
+
+    expected = [] if expected_index is None else [responses[expected_index]]
+    assert results == expected
+    assert [call.args[0] for call in scanner.scan.await_args_list] == expected_urls
+    assert all(call.kwargs == {"deep": True} for call in scanner.scan.await_args_list)
 
 
 def test_full_rejects_invalid_scan_type() -> None:
