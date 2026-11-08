@@ -257,13 +257,16 @@ class PortScanner:
         os_detection: bool = False,
     ) -> HostResult:
         """Scan a single host with scope validation."""
-        self.scope.validate_target(target)
+        # Hand nmap the first scope-validated IP (nmap also scans only a hostname's
+        # first address) so it cannot re-resolve to an out-of-scope address.
+        ips = self.scope.resolve_in_scope(target)
+        unit = str(ips[0]) if ips else self.scope._extract_host(target)
         nm, duration, status = await self._run_nmap(
-            target, ports, scan_type, service_detection, os_detection
+            unit, ports, scan_type, service_detection, os_detection
         )
         if nm is None:
-            return HostResult(ip=target, status=status or "down", scan_duration=duration)
-        return self._parse_nmap_result(nm, target, duration)
+            return HostResult(ip=unit, status=status or "down", scan_duration=duration)
+        return self._parse_nmap_result(nm, unit, duration)
 
     async def _scan_unit(
         self,

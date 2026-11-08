@@ -94,3 +94,28 @@ def test_scan_network_uses_isolated_nmap_instance_per_unit() -> None:
     assert len(created) == 2
     # Each host is reported under its own address, proving no cross-contamination.
     assert {h.ip for h in result.hosts} == {"10.0.0.1", "10.0.0.2"}
+
+
+def test_scan_host_hands_nmap_the_scope_validated_ip(monkeypatch) -> None:
+    import ipaddress
+
+    from netsec_auditor.scanner.engine import PortScanner
+    from netsec_auditor.scanner.scope import Scope
+
+    scope = Scope(name="t", ip_addresses=["10.0.0.1"], max_scan_rate=0)
+    monkeypatch.setattr(
+        scope, "_resolve_to_ips", lambda host: [ipaddress.ip_address("10.0.0.1")]
+    )
+    engine = PortScanner(scope)
+    scanned: list[str] = []
+
+    async def fake_run_nmap(target: str, *args: object) -> tuple[None, float, str]:
+        scanned.append(target)
+        return None, 0.0, "down"
+
+    monkeypatch.setattr(engine, "_run_nmap", fake_run_nmap)
+    result = asyncio.run(engine.scan_host("scanme.test", ports=[80]))
+
+    # nmap gets the validated address, never a hostname it could re-resolve.
+    assert scanned == ["10.0.0.1"]
+    assert result.ip == "10.0.0.1"
