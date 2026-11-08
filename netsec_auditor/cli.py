@@ -1527,17 +1527,21 @@ async def _run_nse_checks(
     )
     for target in targets:
         try:
-            scope.validate_target(target)
+            ips = scope.resolve_in_scope(target)
         except ScopeError as exc:
             console.print(f"[yellow]NSE: skipping {target} — {exc}[/yellow]")
             continue
-        for set_name in script_sets:
-            raw = await nse.run_nse(
-                target,
-                nse.SCRIPT_SETS.get(set_name, []),
-                ports=ports,
-            )
-            findings.extend(nse.summarize_findings(raw))
+        # Hand nmap the scope-validated IPs rather than the hostname so it cannot
+        # re-resolve to an out-of-scope address after the scope check.
+        units = [str(ip) for ip in ips] or [scope._extract_host(target)]
+        for unit in units:
+            for set_name in script_sets:
+                raw = await nse.run_nse(
+                    unit,
+                    nse.SCRIPT_SETS.get(set_name, []),
+                    ports=ports,
+                )
+                findings.extend(nse.summarize_findings(raw))
     if not findings:
         console.print("[green]NSE checks found nothing notable.[/green]")
         return

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import stat
 from unittest.mock import AsyncMock
 
@@ -10,7 +11,8 @@ import typer
 import yaml
 from typer.testing import CliRunner
 
-from netsec_auditor.cli import _scan_web_targets, _write_scope_file, app
+from netsec_auditor.cli import _run_nse_checks, _scan_web_targets, _write_scope_file, app
+from netsec_auditor.integrations import nse
 from netsec_auditor.scanner.scope import Scope, ScopeError
 from netsec_auditor.web.scanner import WebScanResult
 
@@ -189,3 +191,32 @@ def test_weasyprint_status_reflects_native_library(monkeypatch) -> None:
     ok, detail, _ = cli._weasyprint_status()
     assert ok is True
     assert detail == "available"
+
+
+async def test_nse_checks_run_against_the_scope_validated_ips(monkeypatch) -> None:
+    scope = Scope(name="t", ip_addresses=["10.0.0.1"])
+    monkeypatch.setattr(
+        scope, "_resolve_to_ips", lambda host: [ipaddress.ip_address("10.0.0.1")]
+    )
+    run_nse = AsyncMock(return_value=[])
+    monkeypatch.setattr(nse, "nse_available", lambda: True)
+    monkeypatch.setattr(nse, "run_nse", run_nse)
+
+    await _run_nse_checks(scope, ["scanme.test"], ["safe"])
+
+    # nmap gets the validated address, never a hostname it could re-resolve.
+    assert [call.args[0] for call in run_nse.await_args_list] == ["10.0.0.1"]
+
+
+async def test_nse_checks_skip_targets_that_resolve_out_of_scope(monkeypatch) -> None:
+    scope = Scope(name="t", ip_addresses=["10.0.0.1"])
+    monkeypatch.setattr(
+        scope, "_resolve_to_ips", lambda host: [ipaddress.ip_address("10.9.9.9")]
+    )
+    run_nse = AsyncMock(return_value=[])
+    monkeypatch.setattr(nse, "nse_available", lambda: True)
+    monkeypatch.setattr(nse, "run_nse", run_nse)
+
+    await _run_nse_checks(scope, ["elsewhere.test"], ["safe"])
+
+    run_nse.assert_not_awaited()

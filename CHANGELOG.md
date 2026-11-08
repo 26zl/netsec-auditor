@@ -10,6 +10,8 @@ workflow builds the wheel and sdist and attaches them to a
 
 ## [Unreleased]
 
+## [1.0.9] - 2026-11-08
+
 ### Changed
 
 - `full` and `scan` always include the OT/ICS ports so the engine's OT safety
@@ -24,8 +26,17 @@ workflow builds the wheel and sdist and attaches them to a
 
 - `.editorconfig` and this changelog.
 
+### Fixed
+
+- A web audit of a bare hostname falls through to `http://` when the
+  `https://` attempt is unreachable, instead of reporting a plain-HTTP host as
+  unreachable (#16).
+
 ### Security
 
+- `--nse` deep checks and `PortScanner.scan_host` hand nmap the scope-validated
+  IPs rather than the hostname, so a changed DNS answer cannot steer nmap to an
+  out-of-scope address after the scope check.
 - `uv.lock`: Pillow 13.0.0, virtualenv 21.15.2, filelock 4.2.5, certifi
   2026.10.23, Brotli 1.2.1 and brotlicffi 1.2.1.0, clearing the open
   Dependabot alerts. certifi is a runtime dependency (via httpx); the others
@@ -44,5 +55,6 @@ workflow builds the wheel and sdist and attaches them to a
 Release notes for 1.0.0 through 1.0.7 are on
 [GitHub Releases](https://github.com/26zl/netsec-auditor/releases).
 
-[Unreleased]: https://github.com/26zl/netsec-auditor/compare/v1.0.8...HEAD
+[Unreleased]: https://github.com/26zl/netsec-auditor/compare/v1.0.9...HEAD
+[1.0.9]: https://github.com/26zl/netsec-auditor/compare/v1.0.8...v1.0.9
 [1.0.8]: https://github.com/26zl/netsec-auditor/compare/v1.0.7...v1.0.8
