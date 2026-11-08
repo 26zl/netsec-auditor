@@ -159,3 +159,27 @@ def test_script_sets_shape() -> None:
     assert set(SCRIPT_SETS) == {"tls", "smb", "snmp", "ics", "discovery"}
     assert SCRIPT_SETS["tls"] == TLS_SCRIPTS == ["ssl-enum-ciphers", "ssl-cert"]
     assert "smb-vuln-ms17-010" in SCRIPT_SETS["smb"]
+
+
+def test_port_spec_keeps_relevant_open_ports_and_udp_only_with_root() -> None:
+    from netsec_auditor.integrations.nse import port_spec
+
+    assert port_spec("smb", {22, 139, 445}, udp=False) == "T:139,T:445"
+    assert port_spec("snmp", {22}, udp=False) == ""
+    assert port_spec("snmp", {22}, udp=True) == "U:161"
+    assert port_spec("tls", {443, 8443}, udp=False, allowed=[443]) == "T:443"
+
+
+def test_build_nmap_command_scans_udp_ports_and_allows_throttling() -> None:
+    cmd = build_nmap_command("10.0.0.7", SNMP_SCRIPTS, ports="T:502,U:47808")
+    assert cmd[cmd.index("-sU") + 1] == "-sS"
+    throttled = build_nmap_command("h", SNMP_SCRIPTS, extra_args=["--max-rate=100"])
+    assert "--max-rate=100" in throttled
+
+
+def test_ics_set_covers_fox_knx_and_pcworx_but_no_intrusive_scripts() -> None:
+    from netsec_auditor.integrations.nse import ICS_SCRIPTS, port_spec
+
+    assert {"fox-info", "knx-gateway-info", "pcworx-info"} <= set(ICS_SCRIPTS)
+    assert not {"iec-identify", "iec61850-mms", "hartip-info"} & set(ICS_SCRIPTS)
+    assert port_spec("ics", {22, 1911, 1962}, udp=True) == "T:1911,T:1962,U:3671,U:47808"

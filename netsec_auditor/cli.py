@@ -5,22 +5,23 @@ from __future__ import annotations
 import asyncio
 import importlib.resources
 import ipaddress
+import math
 import os
 import re
 import sys
 from collections.abc import Coroutine
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, TypeVar
 from urllib.parse import urlparse
 
 import typer
 from rich.console import Console
-from rich.markup import escape
+from rich.markup import escape as _escape_markup
 from rich.panel import Panel
 from rich.table import Table
 
 from netsec_auditor import __version__
-from netsec_auditor.capture.pcap import analyze_pcap
+from netsec_auditor.capture.pcap import CaptureFormatError, analyze_pcap
 from netsec_auditor.discovery import DEFAULT_PROBE_PORTS, PassiveSniffer, fast_discover
 from netsec_auditor.discovery.fast import TargetLimitError
 from netsec_auditor.discovery.masscan import masscan_discover
@@ -34,32 +35,46 @@ from netsec_auditor.profiles import (
     get_profile,
 )
 from netsec_auditor.protocols import all_specs
+from netsec_auditor.protocols.base import ProbeResult
 from netsec_auditor.protocols.scan import identify_services
-from netsec_auditor.report.generator import ReportGenerator
+from netsec_auditor.report.generator import ReportGenerator, mask_mac
 from netsec_auditor.scanner.engine import (
     COMMON_PORTS,
     TOP_1000_PORTS,
+    HostResult,
     NetworkDiscovery,
     PortScanner,
+    ScanResult,
     is_privileged,
 )
-from netsec_auditor.scanner.scope import Scope, ScopeError, ScopeManager
+from netsec_auditor.scanner.scope import Scope, ScopeError
 from netsec_auditor.utils.logging import configure_logging, get_logger
-from netsec_auditor.vuln.detector import CVEQueryClient, VulnerabilityScanner
-from netsec_auditor.web.scanner import WebScanner
+from netsec_auditor.vuln.detector import CVEQueryClient, VulnerabilityScanner, VulnScanResult
+from netsec_auditor.web.scanner import WebScanner, WebScanResult
 from netsec_auditor.wireless import WirelessInventory, detect_evil_twins
 from netsec_auditor.wireless.ble import scan_ble
 from netsec_auditor.wireless.wifi import scan_wifi
-from netsec_auditor.wireless.wigle import load_wardrive
+from netsec_auditor.wireless.wigle import WardriveFormatError, load_wardrive
 
 app = typer.Typer(
     name="netsec-auditor",
     help="Network Security Auditor — authorized infrastructure security scanning toolkit",
     add_completion=False,
+    # Locals in a crash traceback can include API keys and captured data.
+    pretty_exceptions_show_locals=False,
 )
 
-console = Console()
+# Emoji codes are off so a name such as ":lock: Corp" cannot render a fake security cue.
+console = Console(emoji=False)
 logger = get_logger(__name__)
+
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]")
+
+
+def escape(text: str) -> str:
+    """Escape Rich markup and drop control and bidi characters, which device data can
+    use to inject ANSI/OSC terminal sequences or reorder displayed text."""
+    return _escape_markup(_CONTROL_CHARS.sub("", text))
 
 
 def _print_banner() -> None:
@@ -88,7 +103,15 @@ def _version_callback(value: bool) -> None:
         raise typer.Exit()
 
 
-def _run_async(coro: Coroutine[Any, Any, None]) -> None:
+T = TypeVar("T")
+
+_PORTS_HELP = (
+    "Ports: comma-separated numbers or ranges, 'common', 'top1000' or 'all' "
+    "(default: common plus OT/ICS ports, which engages the OT safety interlock)"
+)
+
+
+def _run_async(coro: Coroutine[Any, Any, T]) -> T:
     """Run an async command body, converting scope/limit errors to clean CLI errors.
 
     Out-of-scope targets and oversized ranges are user-input mistakes; surfacing
@@ -96,11 +119,35 @@ def _run_async(coro: Coroutine[Any, Any, None]) -> None:
     traceback from deep in the scan pipeline.
     """
     try:
-        asyncio.run(coro)
+        return asyncio.run(coro)
     except (ScopeError, TargetLimitError) as exc:
         raise typer.BadParameter(str(exc)) from None
 
-scope_manager = ScopeManager()
+
+def _scan_ports(spec: str | None) -> list[int]:
+    """Ports for scan/vuln/full: by default the common set plus OT/ICS ports, so
+    the engine's OT interlock engages; an explicit --ports list is used as given."""
+    if spec is None:
+        return sorted(set(COMMON_PORTS) | OT_PORTS)
+    return _parse_ports(spec)
+
+
+def _report_generator(output: Path | None) -> ReportGenerator | None:
+    """Create the report directory before any scanning, so a bad --output fails fast."""
+    if output is None:
+        return None
+    try:
+        return ReportGenerator(output_dir=output)
+    except OSError as exc:
+        raise typer.BadParameter(f"cannot use {output}: {exc}", param_hint="--output") from None
+
+
+def _print_report_paths(paths: dict[str, Path]) -> None:
+    console.print("\n[green]Reports generated:[/green]")
+    for fmt_name, path in paths.items():
+        console.print(f"  {fmt_name}: {escape(str(path))}")
+
+
 _STATE = {"ot_safe": False}
 
 
@@ -139,7 +186,7 @@ def callback(
         raise typer.Exit()
 
 
-def _probe_profile(open_ports: set[int]):
+def _probe_profile(open_ports: set[int]) -> Profile:
     """Pick the identification profile, honouring a forced --ot-safe."""
     if _STATE["ot_safe"]:
         return get_profile("ot")
@@ -155,6 +202,15 @@ def _port_scanner(scope: Scope, profile: Profile | None = None) -> PortScanner:
         version_intensity=prof.version_intensity,
         max_retries=1 if prof.scan_delay else 2,
     )
+
+
+def _note_os_detection_skipped(scope: Scope, ports: list[int]) -> None:
+    """Say why -O will not run: the OT safety interlock disables it alongside OT/ICS ports."""
+    if set(_allowed_ports(scope, ports)) & OT_PORTS:
+        console.print(
+            "[yellow]OS detection skipped: the scan includes OT/ICS ports, and the OT "
+            "safety interlock disables -O for them.[/yellow]"
+        )
 
 
 def _allowed_ports(scope: Scope, ports: list[int] | set[int]) -> list[int]:
@@ -180,12 +236,9 @@ def scan(
         ),
     ] = None,
     ports: Annotated[
-        str,
-        typer.Option(
-            "--ports", "-p",
-            help="Ports to scan (comma-separated, 'common', 'top1000', or 'all')",
-        ),
-    ] = "common",
+        str | None,
+        typer.Option("--ports", "-p", help=_PORTS_HELP),
+    ] = None,
     scan_type: Annotated[
         str,
         typer.Option(
@@ -213,23 +266,26 @@ def scan(
         typer.Option("--output", "-o", help="Output directory for reports"),
     ] = None,
     format: Annotated[
-        str,
-        typer.Option("--format", "-f", help="Report format: json, html, pdf, all"),
-    ] = "all",
+        str | None,
+        typer.Option(
+            "--format", "-f",
+            help="Report format: json, html, pdf, all, none (written to ./reports "
+            "when given without --output)",
+        ),
+    ] = None,
 ) -> None:
     """Run a network port scan against authorized targets."""
     scope = _load_scope(scope_file, targets)
-
-    # Always probe OT/ICS ports so the engine's OT safety interlock engages and
-    # fragile devices are scanned read-only rather than with aggressive defaults.
-    port_list = sorted(set(_parse_ports(ports)) | OT_PORTS)
-    report_format = format.lower()
+    port_list = _scan_ports(ports)
+    report_format = (format or "all").lower()
     if report_format not in {"json", "html", "pdf", "all", "none"}:
         raise typer.BadParameter("format must be one of: json, html, pdf, all, none")
     if scan_type.lower() not in {"syn", "connect", "udp"}:
         raise typer.BadParameter("scan type must be one of: syn, connect, udp")
     if concurrency < 1:
         raise typer.BadParameter("concurrency must be at least one")
+    if os_detection:
+        _note_os_detection_skipped(scope, port_list)
 
     console.print(Panel.fit(
         f"[bold cyan]NetSec Auditor — Network Scan[/bold cyan]\n"
@@ -238,9 +294,11 @@ def scan(
         border_style="cyan",
     ))
 
+    write_reports = report_format != "none" and (output is not None or format is not None)
+    report_gen = _report_generator(output or Path("reports")) if write_reports else None
     scanner = _port_scanner(scope)
 
-    async def _run() -> None:
+    async def _run() -> bool:
         result = await scanner.scan_network(
             targets=targets,
             ports=port_list,
@@ -250,20 +308,19 @@ def scan(
             concurrency=concurrency,
         )
         _display_scan_results(result)
+        incomplete = _warn_failed_scans(result)
 
-        if report_format != "none":
-            report_gen = ReportGenerator(output_dir=output)
-            paths = report_gen.generate_all(
+        if report_gen:
+            _print_report_paths(report_gen.generate_all(
                 scan_result=result,
                 title="Network Scan Report",
                 scope_name=scope.name,
                 formats=None if report_format == "all" else {report_format},
-            )
-            console.print("\n[green]Reports generated:[/green]")
-            for fmt_name, path in paths.items():
-                console.print(f"  {fmt_name}: {path}")
+            ))
+        return incomplete
 
-    _run_async(_run())
+    if _run_async(_run()):
+        raise typer.Exit(1)
 
 
 @app.command()
@@ -286,6 +343,7 @@ def discover(
     ] = False,
 ) -> None:
     """Discover live hosts on a network."""
+    _require_network(cidr)
     scope = _load_scope(scope_file, [cidr])
     method = method.lower()
     if method not in {"ping", "arp", "both"}:
@@ -333,6 +391,7 @@ def discover(
             return
 
         live_hosts: list[str] = []
+        arp_results: list[dict[str, str]] = []
 
         if method in ("ping", "both"):
             hosts = await discovery.ping_sweep(cidr)
@@ -340,20 +399,21 @@ def discover(
             console.print(f"[green]Ping sweep: {len(hosts)} hosts found[/green]")
 
         if method in ("arp", "both"):
-            arp_results = await discovery.arp_scan(cidr)
-            for r in arp_results:
-                if r["ip"] not in live_hosts:
-                    live_hosts.append(r["ip"])
-            console.print(f"[green]ARP scan: {len(arp_results)} hosts found[/green]")
+            if is_privileged():
+                arp_results = await discovery.arp_scan(cidr)
+                for r in arp_results:
+                    if r["ip"] not in live_hosts:
+                        live_hosts.append(r["ip"])
+                console.print(f"[green]ARP scan: {len(arp_results)} hosts found[/green]")
+            else:
+                console.print("[yellow]ARP scan skipped: it needs root (raw sockets).[/yellow]")
 
         if live_hosts:
             table = Table(title="Discovered Hosts")
             table.add_column("IP Address", style="cyan")
             table.add_column("MAC Address", style="green")
             for host in sorted(set(live_hosts)):
-                mac = next(
-                    (r["mac"] for r in arp_results if r["ip"] == host), "N/A"
-                ) if method in ("arp", "both") else "N/A"
+                mac = next((r["mac"] for r in arp_results if r["ip"] == host), "N/A")
                 table.add_row(host, mac)
             console.print(table)
         else:
@@ -373,9 +433,9 @@ def vuln(
         typer.Option("--scope", "-s", exists=True, help="Scope definition YAML"),
     ] = None,
     ports: Annotated[
-        str,
-        typer.Option("--ports", "-p", help="Ports to scan"),
-    ] = "common",
+        str | None,
+        typer.Option("--ports", "-p", help=_PORTS_HELP),
+    ] = None,
     cve_check: Annotated[
         bool,
         typer.Option("--cve-check/--no-cve-check", help="Query NVD for CVEs"),
@@ -406,7 +466,8 @@ def vuln(
 ) -> None:
     """Scan targets for known vulnerabilities and misconfigurations."""
     scope = _load_scope(scope_file, targets)
-    port_list = _parse_ports(ports)
+    port_list = _scan_ports(ports)
+    report_gen = _report_generator(output)
 
     console.print(Panel.fit(
         f"[bold red]NetSec Auditor — Vulnerability Scan[/bold red]\n"
@@ -418,13 +479,21 @@ def vuln(
     vuln_scanner = VulnerabilityScanner()
     cve_client = CVEQueryClient(api_key=nvd_api_key or "") if cve_check else None
 
-    async def _run() -> None:
+    async def _run() -> bool:
+        scan_type = "syn"
+        if not is_privileged():
+            console.print(
+                "[yellow]Not root — using a TCP connect scan (SYN requires root).[/yellow]"
+            )
+            scan_type = "connect"
         scan_result = await scanner.scan_network(
             targets=targets,
             ports=port_list,
+            scan_type=scan_type,
             service_detection=True,
             concurrency=10,
         )
+        incomplete = _warn_failed_scans(scan_result)
 
         vuln_results = await vuln_scanner.scan_hosts(scan_result.hosts)
 
@@ -446,24 +515,22 @@ def vuln(
             script_sets = ["smb", "snmp", "tls"]
             if nse_ics:
                 script_sets.append("ics")
-            await _run_nse_checks(scope, targets, script_sets)
+            await _run_nse_checks(scope, scan_result.hosts, script_sets)
 
-        if output:
-            report_gen = ReportGenerator(output_dir=output)
-            paths = report_gen.generate_all(
+        if report_gen:
+            _print_report_paths(report_gen.generate_all(
                 scan_result=scan_result,
                 vuln_results=vuln_results,
                 title="Vulnerability Assessment Report",
                 scope_name=scope.name,
-            )
-            console.print("\n[green]Reports generated:[/green]")
-            for fmt_name, path in paths.items():
-                console.print(f"  {fmt_name}: {path}")
+            ))
 
         if cve_client:
             await cve_client.close()
+        return incomplete
 
-    _run_async(_run())
+    if _run_async(_run()):
+        raise typer.Exit(1)
 
 
 @app.command()
@@ -542,9 +609,9 @@ def full(
         typer.Option("--scope", "-s", exists=True, help="Scope definition YAML"),
     ] = None,
     ports: Annotated[
-        str,
-        typer.Option("--ports", "-p", help="Ports to scan"),
-    ] = "common",
+        str | None,
+        typer.Option("--ports", "-p", help=_PORTS_HELP),
+    ] = None,
     scan_type: Annotated[
         str,
         typer.Option(
@@ -590,9 +657,7 @@ def full(
 ) -> None:
     """Run a full security audit — network scan, vulnerability assessment, and web scan."""
     scope = _load_scope(scope_file, targets)
-    # Always probe OT/ICS ports so the engine's OT safety interlock engages and
-    # fragile devices are scanned read-only rather than with aggressive defaults.
-    port_list = sorted(set(_parse_ports(ports)) | OT_PORTS)
+    port_list = _scan_ports(ports)
     if concurrency < 1:
         raise typer.BadParameter("concurrency must be at least one")
     if scan_type.lower() not in {"syn", "connect", "udp"}:
@@ -626,8 +691,9 @@ def full(
     vuln_scanner = VulnerabilityScanner()
     cve_client = CVEQueryClient(api_key=nvd_api_key or "") if cve_check else None
     web_scanner = WebScanner(scope=scope, concurrency=concurrency) if web_scan else None
+    report_gen = _report_generator(output)
 
-    async def _run() -> None:
+    async def _run() -> bool:
         console.print("\n[bold]Phase 1/4: Network Discovery & Port Scanning[/bold]")
         # SYN/UDP scans and OS detection need root; fall back to a connect scan so
         # the audit still runs unprivileged instead of failing with "requires root".
@@ -643,6 +709,8 @@ def full(
             console.print(
                 "[yellow]OS detection (-O) requires root — continuing without it.[/yellow]"
             )
+        elif os_detect:
+            _note_os_detection_skipped(scope, port_list)
         scan_result = await scanner.scan_network(
             targets=scan_targets,
             ports=port_list,
@@ -652,6 +720,7 @@ def full(
             concurrency=concurrency,
         )
         _display_scan_results(scan_result)
+        incomplete = _warn_failed_scans(scan_result)
 
         console.print("\n[bold]Phase 2/4: Vulnerability Assessment[/bold]")
         vuln_results = await vuln_scanner.scan_hosts(scan_result.hosts)
@@ -689,27 +758,7 @@ def full(
                 console.print("[yellow]No web interfaces responded.[/yellow]")
 
         console.print("\n[bold]Phase 4/4: OT/IoT Device Identification[/bold]")
-        identified = []
-        tcp_probe = {s.default_port for s in all_specs() if s.transport == "tcp"}
-        udp_probe = _allowed_ports(
-            scope, {s.default_port for s in all_specs() if s.transport == "udp"}
-        )
-        for host in scan_result.hosts:
-            host_ports = _allowed_ports(
-                scope, [p.port for p in host.open_ports if p.port in tcp_probe]
-            )
-            # Classify on what the host actually exposes; host_ports always carries
-            # the UDP probe candidates (44818/47808), which would force OT on every host.
-            prof = _probe_profile({p.port for p in host.open_ports})
-            for probe in await identify_services(
-                host.ip,
-                host_ports,
-                prof,
-                rate_per_second=scope.max_scan_rate,
-                udp_ports=udp_probe,
-            ):
-                probe.extra["host"] = host.ip
-                identified.append(probe)
+        identified = await _identify_scanned_hosts(scope, scan_result.hosts)
         for probe in identified:
             info = ", ".join(f"{k}={v}" for k, v in list(probe.device_info.items())[:3])
             console.print(
@@ -718,9 +767,8 @@ def full(
                 f"— {escape(info)}"
             )
 
-        if output:
-            report_gen = ReportGenerator(output_dir=output)
-            paths = report_gen.generate_all(
+        if report_gen:
+            _print_report_paths(report_gen.generate_all(
                 scan_result=scan_result,
                 vuln_results=vuln_results,
                 web_results=web_results if web_results else None,
@@ -728,17 +776,16 @@ def full(
                 cve_priorities=cve_priorities or None,
                 title="Full Security Audit Report",
                 scope_name=scope.name,
-            )
-            console.print("\n[green]Reports generated:[/green]")
-            for fmt_name, path in paths.items():
-                console.print(f"  {fmt_name}: {path}")
+            ))
 
         if cve_client:
             await cve_client.close()
         if web_scanner:
             await web_scanner.close()
+        return incomplete
 
-    _run_async(_run())
+    if _run_async(_run()):
+        raise typer.Exit(1)
 
 
 @app.command()
@@ -763,19 +810,22 @@ def scope(
         if not scope_file or not target:
             console.print("[red]--file and --target are required for validation[/red]")
             raise typer.Exit(1)
-        scope = Scope.from_yaml(scope_file)
         # Exit non-zero on a failed check so callers can gate a scan on this command.
         try:
-            scope.validate_target(target)
+            Scope.from_yaml(scope_file).validate_target(target)
         except ScopeError as e:
-            console.print(f"[red]{e}[/red]")
+            console.print(f"[red]{escape(str(e))}[/red]")
             raise typer.Exit(1) from None
-        console.print(f"[green]Target {target} is within authorized scope.[/green]")
+        console.print(f"[green]Target {escape(target)} is within authorized scope.[/green]")
     elif action == "show":
         if not scope_file:
             console.print("[red]--file is required[/red]")
             raise typer.Exit(1)
-        scope = Scope.from_yaml(scope_file)
+        try:
+            scope = Scope.from_yaml(scope_file)
+        except ScopeError as e:
+            console.print(f"[red]{escape(str(e))}[/red]")
+            raise typer.Exit(1) from None
         console.print_json(data=scope.to_dict())
     else:
         console.print(f"[red]Unknown action: {action}[/red]")
@@ -810,11 +860,11 @@ def cve(
             if result:
                 console.print_json(data=result)
             else:
-                console.print(f"[yellow]CVE {query} not found.[/yellow]")
+                console.print(f"[yellow]CVE {escape(query)} not found.[/yellow]")
         else:
             results = await client.search_cve(query, limit=limit)
             if results:
-                table = Table(title=f"CVEs matching '{query}'")
+                table = Table(title=escape(f"CVEs matching '{query}'"))
                 table.add_column("CVE ID", style="cyan")
                 table.add_column("Severity", style="red")
                 table.add_column("Score")
@@ -831,7 +881,7 @@ def cve(
                     )
                 console.print(table)
             else:
-                console.print(f"[yellow]No CVEs found for '{query}'.[/yellow]")
+                console.print(f"[yellow]No CVEs found for '{escape(query)}'.[/yellow]")
 
         await client.close()
 
@@ -881,7 +931,8 @@ def identify(
     ports = _allowed_ports(scope, ports)
     if not ports:
         raise typer.BadParameter("none of the requested protocol ports are allowed by the scope")
-    udp_spec_ports = {s.default_port for s in all_specs() if s.transport == "udp"}
+    # UDP probes follow the same protocol selection and scope allow-list as TCP ones.
+    udp_spec_ports = set(ports) & {s.default_port for s in all_specs() if s.transport == "udp"}
 
     forced = profile != "auto"
     base_profile = get_profile(profile if forced else "it")
@@ -911,12 +962,21 @@ def identify(
         found = False
         for target in targets:
             try:
-                scope.validate_target(target)
+                ips = scope.resolve_in_scope(target)
             except Exception as e:
-                console.print(f"[red]{e}[/red]")
+                console.print(f"[red]{escape(str(e))}[/red]")
                 continue
+            if not ips:
+                console.print(
+                    f"[yellow]{escape(target)} is a range — identify probes single hosts; "
+                    "use 'full' or 'walk' for ranges.[/yellow]"
+                )
+                continue
+            # Probe the validated address so a later DNS answer cannot redirect the probes.
+            host = str(ips[0])
+            label = target if host == target else f"{target} ({host})"
             results = await identify_services(
-                target,
+                host,
                 ports,
                 prof,
                 timeout=timeout,
@@ -927,7 +987,7 @@ def identify(
                 found = True
                 info = ", ".join(f"{k}={v}" for k, v in list(r.device_info.items())[:4])
                 table.add_row(
-                    escape(target), escape(r.protocol), f"{r.port}/{r.transport}",
+                    escape(label), escape(r.protocol), f"{r.port}/{r.transport}",
                     "OT" if r.is_ot else "IoT",
                     escape(info or r.banner[:60]) or "—",
                 )
@@ -1008,7 +1068,7 @@ def enrich(
             for r in rows:
                 color = colors.get(r["priority"], "white")
                 table.add_row(
-                    r["cve_id"],
+                    escape(r["cve_id"]),
                     f"[{color}]{r['priority'].upper()}[/{color}]",
                     f"{r['cvss']:.1f}",
                     f"{r['percentile'] * 100:.0f}%",
@@ -1035,8 +1095,7 @@ def passive(
     ] = None,
 ) -> None:
     """Passively inventory hosts by sniffing traffic — zero packets sent (requires root)."""
-    if seconds <= 0:
-        raise typer.BadParameter("seconds must be greater than zero")
+    _require_duration(seconds, "seconds")
     console.print(Panel.fit(
         "[bold green]NetSec Auditor — Passive Discovery[/bold green]\n"
         f"Capturing {seconds}s | Interface: {iface or 'default'} | Zero packets sent",
@@ -1061,14 +1120,16 @@ def passive(
         table.add_column("Ports")
         table.add_column("Protocols")
         table.add_column("Class")
+        table.add_column("Device")
         for host in hosts:
             cls = "OT" if host["is_ot"] else ("IoT" if host["is_iot"] else "IT")
             table.add_row(
-                escape(host["ip"]),
+                escape(host["ip"]) or "[dim](layer 2)[/dim]",
                 escape(host["mac"]) or "—",
                 ", ".join(str(p) for p in host["ports"][:10]) or "—",
                 escape(", ".join(host["protocols"][:6])) or "—",
                 cls,
+                _device_summary(host.get("device")),
             )
         console.print(table)
 
@@ -1089,7 +1150,7 @@ def wifi(
         bool,
         typer.Option(
             "--redact/--no-redact",
-            help="Truncate BSSIDs and client MACs to their vendor OUI in reports",
+            help="Truncate BSSIDs and client MACs to their vendor OUI on screen and in reports",
         ),
     ] = True,
     output: Annotated[
@@ -1100,10 +1161,10 @@ def wifi(
     """Wi-Fi recon — enumerate APs, encryption, WPS and clients (read-only).
 
     A scan catalogs every network in range, including bystanders', so BSSIDs and
-    client MACs are redacted in reports unless --no-redact is given.
+    client MACs are redacted on screen and in reports unless --no-redact is given.
     """
-    if duration <= 0:
-        raise typer.BadParameter("duration must be greater than zero")
+    _require_duration(duration, "duration")
+    report_gen = _report_generator(output)
     console.print(Panel.fit(
         "[bold magenta]NetSec Auditor — Wi-Fi Recon[/bold magenta]\n"
         f"Interface: {iface or 'auto'} | Duration: {duration}s | Read-only (no attack frames)",
@@ -1113,14 +1174,13 @@ def wifi(
     async def _run() -> None:
         inventory = await scan_wifi(iface=iface, duration=duration)
         detect_evil_twins(inventory.aps())
-        _display_wifi(inventory)
-        if output:
-            ReportGenerator(output_dir=output).generate_all(
+        _display_wifi(inventory, redact=redact)
+        if report_gen:
+            _print_report_paths(report_gen.generate_all(
                 wireless=inventory,
                 title="Wi-Fi Recon Report",
                 redact_wireless=redact,
-            )
-            console.print(f"\n[green]Report written to {output}[/green]")
+            ))
 
     _run_async(_run())
 
@@ -1135,13 +1195,19 @@ def ble(
         str | None,
         typer.Option("--adapter", help="Bluetooth adapter (e.g. hci0)"),
     ] = None,
+    redact: Annotated[
+        bool,
+        typer.Option(
+            "--redact/--no-redact",
+            help="Truncate device addresses to their vendor OUI on screen",
+        ),
+    ] = True,
 ) -> None:
-    """Passive BLE recon — enumerate advertising IoT devices (read-only)."""
-    if duration <= 0:
-        raise typer.BadParameter("duration must be greater than zero")
+    """BLE recon — enumerate advertising IoT devices (read-only; the OS sends scan requests)."""
+    _require_duration(duration, "duration")
     console.print(Panel.fit(
         "[bold blue]NetSec Auditor — BLE Recon[/bold blue]\n"
-        f"Duration: {duration}s | Passive advertisement scan",
+        f"Duration: {duration}s | Advertisement scan",
         border_style="blue",
     ))
 
@@ -1149,7 +1215,7 @@ def ble(
         inventory = WirelessInventory()
         for device in await scan_ble(duration=duration, adapter=adapter):
             inventory.add_ble(device)
-        _display_ble(inventory)
+        _display_ble(inventory, redact=redact)
 
     _run_async(_run())
 
@@ -1171,7 +1237,7 @@ def wardrive(
         bool,
         typer.Option(
             "--redact/--no-redact",
-            help="Truncate BSSIDs to their vendor OUI and coarsen GPS in reports",
+            help="Truncate BSSIDs to their vendor OUI and coarsen GPS on screen and in reports",
         ),
     ] = True,
     output: Annotated[
@@ -1184,9 +1250,15 @@ def wardrive(
     A wardrive export covers every network in range, most of which belong to third
     parties, so imports are redacted by default and can be narrowed with --ssid.
     """
+    report_gen = _report_generator(output)
+    try:
+        access_points = load_wardrive(file)
+    except WardriveFormatError as exc:
+        console.print(f"[red]Cannot import {escape(file.name)}: {escape(str(exc))}[/red]")
+        raise typer.Exit(1) from None
     inventory = WirelessInventory()
     kept = 0
-    for ap in load_wardrive(file):
+    for ap in access_points:
         if ssid_filter and ssid_filter.lower() not in (ap.ssid or "").lower():
             continue
         inventory.add_ap(ap)
@@ -1203,14 +1275,13 @@ def wardrive(
         f"Source: {file.name} | Access points: {len(inventory.aps())}",
         border_style="magenta",
     ))
-    _display_wifi(inventory)
-    if output:
-        ReportGenerator(output_dir=output).generate_all(
+    _display_wifi(inventory, redact=redact)
+    if report_gen:
+        _print_report_paths(report_gen.generate_all(
             wireless=inventory,
             title="Wardrive Audit Report",
             redact_wireless=redact,
-        )
-        console.print(f"\n[green]Report written to {output}[/green]")
+        ))
 
 
 @app.command()
@@ -1239,22 +1310,31 @@ def walk(
         float,
         typer.Option("--duration", "-t", help="Wireless scan duration in seconds"),
     ] = 15.0,
+    redact: Annotated[
+        bool,
+        typer.Option(
+            "--redact/--no-redact",
+            help="Truncate BSSIDs, client MACs and BLE addresses to their vendor OUI on screen "
+            "and in reports",
+        ),
+    ] = True,
     output: Annotated[
         Path | None,
         typer.Option("--output", "-o", help="Output directory for the combined report"),
     ] = None,
 ) -> None:
     """Walk-around audit: discover, scan, identify OT/IoT, and optionally Wi-Fi/BLE."""
-    if duration <= 0:
-        raise typer.BadParameter("duration must be greater than zero")
+    _require_duration(duration, "duration")
+    _require_network(cidr)
     scope = _load_scope(scope_file, [cidr])
+    report_gen = _report_generator(output)
     console.print(Panel.fit(
         "[bold yellow]NetSec Auditor — Walk-Around Audit[/bold yellow]\n"
         f"Network: {cidr} | Wi-Fi: {wifi_scan} | BLE: {ble_scan}",
         border_style="yellow",
     ))
 
-    async def _run() -> None:
+    async def _run() -> bool:
         scope.validate_target(cidr)
         console.print("\n[bold]Discovering live hosts...[/bold]")
         discovery_ports = _allowed_ports(scope, DEFAULT_PROBE_PORTS)
@@ -1271,9 +1351,10 @@ def walk(
         console.print(f"[green]{len(hosts)} live hosts[/green]")
 
         scan_result = None
-        vuln_results = []
-        identified = []
-        cve_priorities = []
+        incomplete = False
+        vuln_results: list[VulnScanResult] = []
+        identified: list[ProbeResult] = []
+        cve_priorities: list[dict[str, Any]] = []
         if hosts:
             scanner = _port_scanner(scope)
             tcp_probe_ports = {
@@ -1284,47 +1365,28 @@ def walk(
                 targets=hosts, ports=scan_ports, scan_type="connect", concurrency=20
             )
             _display_scan_results(scan_result)
+            incomplete = _warn_failed_scans(scan_result)
 
             vuln_scanner = VulnerabilityScanner()
             vuln_results = await vuln_scanner.scan_hosts(scan_result.hosts)
             _display_vuln_results(vuln_results)
             cve_priorities = await _display_cve_priorities(vuln_results)
-
-            udp_probe_ports = _allowed_ports(
-                scope,
-                {spec.default_port for spec in all_specs() if spec.transport == "udp"},
-            )
-            for host in scan_result.hosts:
-                host_ports = _allowed_ports(
-                    scope, [p.port for p in host.open_ports if p.port in tcp_probe_ports]
-                )
-                if not host_ports and not udp_probe_ports:
-                    continue
-                prof = _probe_profile({p.port for p in host.open_ports})
-                for probe in await identify_services(
-                    host.ip,
-                    host_ports,
-                    prof,
-                    rate_per_second=scope.max_scan_rate,
-                    udp_ports=udp_probe_ports,
-                ):
-                    probe.extra["host"] = host.ip
-                    identified.append(probe)
+            identified = await _identify_scanned_hosts(scope, scan_result.hosts)
 
         inventory = WirelessInventory()
         if wifi_scan:
             console.print("\n[bold]Wi-Fi recon...[/bold]")
             inventory = await scan_wifi(iface=iface, duration=duration)
             detect_evil_twins(inventory.aps())
-            _display_wifi(inventory)
+            _display_wifi(inventory, redact=redact)
         if ble_scan:
             console.print("\n[bold]BLE recon...[/bold]")
             for device in await scan_ble(duration=duration):
                 inventory.add_ble(device)
-            _display_ble(inventory)
+            _display_ble(inventory, redact=redact)
 
-        if output:
-            ReportGenerator(output_dir=output).generate_all(
+        if report_gen:
+            _print_report_paths(report_gen.generate_all(
                 scan_result=scan_result,
                 vuln_results=vuln_results or None,
                 identified_services=identified or None,
@@ -1332,10 +1394,12 @@ def walk(
                 cve_priorities=cve_priorities or None,
                 title="Walk-Around Audit Report",
                 scope_name=scope.name,
-            )
-            console.print(f"\n[green]Combined report written to {output}[/green]")
+                redact_wireless=redact,
+            ))
+        return incomplete
 
-    _run_async(_run())
+    if _run_async(_run()):
+        raise typer.Exit(1)
 
 
 def _weasyprint_status() -> tuple[bool | None, str, str]:
@@ -1410,7 +1474,7 @@ def doctor() -> None:
     console.print(table)
 
 
-def _display_wifi(inventory: WirelessInventory) -> None:
+def _display_wifi(inventory: WirelessInventory, *, redact: bool = True) -> None:
     """Display Wi-Fi access points and their security findings."""
     aps = inventory.aps()
     if not aps:
@@ -1429,14 +1493,14 @@ def _display_wifi(inventory: WirelessInventory) -> None:
         enc = ap.encryption.upper() + (" +WPS" if ap.wps else "")
         table.add_row(
             escape(ap.ssid) if ap.ssid else "[dim](hidden)[/dim]",
-            escape(ap.bssid), str(ap.channel or "—"),
+            escape(mask_mac(ap.bssid) if redact else ap.bssid), str(ap.channel or "—"),
             escape(enc), f"{ap.signal_dbm} dBm" if ap.signal_dbm else "—",
             escape("; ".join(ap.issues)) or "—",
         )
     console.print(table)
 
 
-def _display_ble(inventory: WirelessInventory) -> None:
+def _display_ble(inventory: WirelessInventory, *, redact: bool = True) -> None:
     """Display BLE devices and their security findings."""
     devices = inventory.ble()
     if not devices:
@@ -1454,7 +1518,7 @@ def _display_ble(inventory: WirelessInventory) -> None:
     for device in devices:
         table.add_row(
             escape(device.name) if device.name else "[dim](unnamed)[/dim]",
-            escape(device.address), str(device.rssi),
+            escape(mask_mac(device.address) if redact else device.address), str(device.rssi),
             escape(device.vendor) or "—", escape("; ".join(device.issues)) or "—",
         )
     console.print(table)
@@ -1468,7 +1532,11 @@ def pcap(
     ],
 ) -> None:
     """Analyze an offline capture — host inventory and cleartext credentials."""
-    result = analyze_pcap(file)
+    try:
+        result = analyze_pcap(file)
+    except CaptureFormatError as exc:
+        console.print(f"[red]Cannot analyze {escape(file.name)}: {escape(str(exc))}[/red]")
+        raise typer.Exit(1) from None
     hosts = result["hosts"]
     creds = result["credentials"]
     console.print(Panel.fit(
@@ -1484,11 +1552,13 @@ def pcap(
         table.add_column("MAC")
         table.add_column("Ports")
         table.add_column("Protocols")
+        table.add_column("Device")
         for host in hosts[:50]:
             table.add_row(
-                escape(host["ip"]), escape(host.get("mac", "")) or "—",
+                escape(host["ip"]) or "[dim](layer 2)[/dim]", escape(host.get("mac", "")) or "—",
                 ", ".join(str(p) for p in host.get("ports", [])[:8]) or "—",
                 escape(", ".join(host.get("protocols", [])[:6])) or "—",
+                _device_summary(host.get("device")),
             )
         console.print(table)
 
@@ -1508,40 +1578,48 @@ def pcap(
         console.print("[green]No cleartext credentials found.[/green]")
 
 
+# Polite nmap settings for NSE runs that touch OT devices.
+_NSE_OT_PACING = ["-T2", "--scan-delay=500ms", "--max-retries=1", "--max-parallelism=1"]
+
+
 async def _run_nse_checks(
-    scope: Scope, targets: list[str], script_sets: list[str]
+    scope: Scope, hosts: list[HostResult], script_sets: list[str]
 ) -> None:
-    """Run curated nmap NSE script sets and display the summarized findings."""
+    """Run curated NSE sets on the open ports the scan found and show the findings.
+
+    Each set only probes its relevant ports, at the scope's rate, with polite timing
+    whenever OT is involved, so NSE cannot bypass the scan's OT safety interlock.
+    """
     if not nse.nse_available():
         console.print("[yellow]nmap not found — NSE deep checks skipped.[/yellow]")
         return
-    if scope.allowed_ports == []:
-        console.print("[yellow]NSE checks skipped: the scope allows no ports.[/yellow]")
-        return
+    udp = is_privileged()
+    if not udp and any(nse.SET_PORTS.get(name, (None, frozenset()))[1] for name in script_sets):
+        console.print(
+            "[yellow]NSE UDP checks (SNMP, BACnet) skipped: UDP scanning needs root.[/yellow]"
+        )
     console.print("\n[bold]Running nmap NSE deep checks...[/bold]")
-    findings: list[dict] = []
-    ports = (
-        ",".join(str(port) for port in scope.allowed_ports)
-        if scope.allowed_ports is not None
-        else None
-    )
-    for target in targets:
-        try:
-            ips = scope.resolve_in_scope(target)
-        except ScopeError as exc:
-            console.print(f"[yellow]NSE: skipping {target} — {exc}[/yellow]")
+    findings: list[dict[str, Any]] = []
+    for host in hosts:
+        if host.status != "up":
             continue
-        # Hand nmap the scope-validated IPs rather than the hostname so it cannot
-        # re-resolve to an out-of-scope address after the scope check.
-        units = [str(ip) for ip in ips] or [scope._extract_host(target)]
-        for unit in units:
-            for set_name in script_sets:
-                raw = await nse.run_nse(
-                    unit,
-                    nse.SCRIPT_SETS.get(set_name, []),
-                    ports=ports,
-                )
-                findings.extend(nse.summarize_findings(raw))
+        try:
+            scope.validate_target(host.ip)
+        except ScopeError as exc:
+            console.print(f"[yellow]NSE: skipping {escape(host.ip)} — {escape(str(exc))}[/yellow]")
+            continue
+        open_tcp = {p.port for p in host.open_ports if p.protocol == "tcp"}
+        for set_name in script_sets:
+            ports = nse.port_spec(set_name, open_tcp, udp=udp, allowed=scope.allowed_ports)
+            if not ports:
+                continue
+            pacing = [f"--max-rate={scope.max_scan_rate}"] if scope.max_scan_rate > 0 else []
+            if _STATE["ot_safe"] or set_name == "ics" or open_tcp & OT_PORTS:
+                pacing += _NSE_OT_PACING
+            raw = await nse.run_nse(
+                host.ip, nse.SCRIPT_SETS.get(set_name, []), ports=ports, extra_args=pacing
+            )
+            findings.extend(nse.summarize_findings(raw))
     if not findings:
         console.print("[green]NSE checks found nothing notable.[/green]")
         return
@@ -1558,6 +1636,50 @@ async def _run_nse_checks(
             escape(str(f.get("name", ""))),
         )
     console.print(table)
+
+
+async def _identify_scanned_hosts(scope: Scope, hosts: list[HostResult]) -> list[ProbeResult]:
+    """Identify OT/IoT services on scanned hosts without exposing OT devices to IT timing.
+
+    UDP-only controllers (BACnet) never show up in a TCP scan, so the OT UDP probes run
+    first under the OT profile, and any OT answer selects the OT profile for the rest.
+    """
+    specs = all_specs()
+    tcp_probe = {s.default_port for s in specs if s.transport == "tcp"}
+    udp_specs = [s for s in specs if s.transport == "udp"]
+    ot_udp = _allowed_ports(scope, {s.default_port for s in udp_specs if s.is_ot})
+    other_udp = [
+        port
+        for port in _allowed_ports(scope, {s.default_port for s in udp_specs})
+        if port not in ot_udp
+    ]
+    identified: list[ProbeResult] = []
+    for host in hosts:
+        try:
+            ipaddress.ip_address(host.ip)
+        except ValueError:
+            continue  # a failed range unit has no single address to probe
+        if host.status == "error":
+            continue
+        open_ports = {p.port for p in host.open_ports}
+        results: list[ProbeResult] = []
+        if ot_udp:
+            results = await identify_services(
+                host.ip, [], get_profile("ot"),
+                rate_per_second=scope.max_scan_rate, udp_ports=ot_udp,
+            )
+        profile = _probe_profile(open_ports | {r.port for r in results if r.is_ot})
+        results += await identify_services(
+            host.ip,
+            _allowed_ports(scope, [port for port in open_ports if port in tcp_probe]),
+            profile,
+            rate_per_second=scope.max_scan_rate,
+            udp_ports=other_udp,
+        )
+        for probe in results:
+            probe.extra["host"] = host.ip
+        identified.extend(results)
+    return identified
 
 
 async def _scan_web_targets(
@@ -1581,9 +1703,26 @@ async def _scan_web_targets(
                         return result
                 except (ScopeError, ValueError) as exc:
                     logger.debug("web_scan_skipped", target=target, error=str(exc))
+                except Exception as exc:  # one hostile device must not abort the whole run
+                    logger.warning(
+                        "web_scan_failed", target=f"{scheme}{target}", error=repr(exc)[:200]
+                    )
         return result
 
     return [r for r in await asyncio.gather(*(_one(t) for t in targets)) if r is not None]
+
+
+def _require_network(value: str) -> None:
+    """Reject anything but an IP address or CIDR range, since a hostname cannot be swept."""
+    try:
+        ipaddress.ip_network(value.strip(), strict=False)
+    except ValueError:
+        raise typer.BadParameter(f"expected an IP address or CIDR range, got {value!r}") from None
+
+
+def _require_duration(seconds: float, name: str) -> None:
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise typer.BadParameter(f"{name} must be a finite number greater than zero")
 
 
 def _load_scope(scope_file: Path | None, targets: list[str]) -> Scope:
@@ -1598,8 +1737,7 @@ def _load_scope(scope_file: Path | None, targets: list[str]) -> Scope:
     ips: list[str] = []
     domains: list[str] = []
     for raw in targets:
-        host = urlparse(raw).hostname if "://" in raw else raw
-        host = (host or raw).strip()
+        host = Scope._extract_host(raw)
         if "/" in host:
             try:
                 ipaddress.ip_network(host, strict=False)
@@ -1661,7 +1799,7 @@ def _parse_ports(ports: str) -> list[int]:
         raise typer.Exit(1) from None
 
 
-def _display_scan_results(result) -> None:
+def _display_scan_results(result: ScanResult) -> None:
     """Display scan results in a rich table."""
     table = Table(title="Scan Results")
     table.add_column("Host", style="cyan")
@@ -1708,7 +1846,29 @@ def _display_scan_results(result) -> None:
         )
 
 
-def _display_vuln_results(vuln_results) -> None:
+def _device_summary(device: dict[str, str] | None) -> str:
+    """One escaped cell for a passively observed identity (e.g. PROFINET DCP)."""
+    if not device:
+        return "—"
+    return escape(", ".join(f"{key}={value}" for key, value in device.items()))
+
+
+def _warn_failed_scans(result: ScanResult) -> bool:
+    """Flag targets nmap could not scan, so an empty finding list is not read as clean.
+
+    Returns True when results are incomplete; the command then exits with status 1.
+    """
+    failed = [host.ip for host in result.hosts if host.status == "error"]
+    if failed:
+        shown = ", ".join(failed[:5]) + (" …" if len(failed) > 5 else "")
+        console.print(
+            f"[yellow]nmap could not scan {len(failed)} target(s): {escape(shown)} — "
+            "their results are missing; re-run with -v for the nmap error.[/yellow]"
+        )
+    return bool(failed)
+
+
+def _display_vuln_results(vuln_results: list[VulnScanResult]) -> None:
     """Display vulnerability results."""
     total_vulns = sum(len(vr.vulnerabilities) for vr in vuln_results)
     total_critical = sum(vr.critical_count for vr in vuln_results)
@@ -1726,7 +1886,7 @@ def _display_vuln_results(vuln_results) -> None:
 
     for vr in vuln_results:
         table.add_row(
-            vr.host,
+            escape(vr.host),
             str(vr.critical_count),
             str(vr.high_count),
             str(vr.medium_count),
@@ -1766,7 +1926,7 @@ def _display_vuln_results(vuln_results) -> None:
             )
 
 
-async def _display_cve_priorities(vuln_results) -> list[dict]:
+async def _display_cve_priorities(vuln_results: list[VulnScanResult]) -> list[dict[str, Any]]:
     """Enrich CVE-bearing findings with EPSS + CISA KEV and display priorities."""
     cvss_by_cve: dict[str, float] = {}
     for vr in vuln_results:
@@ -1805,7 +1965,7 @@ async def _display_cve_priorities(vuln_results) -> list[dict]:
     return rows
 
 
-def _display_web_result(result) -> None:
+def _display_web_result(result: WebScanResult) -> None:
     """Display web scan result."""
     console.print(f"\n[bold magenta]{escape(result.url)}[/bold magenta]")
     if not result.reachable:
@@ -1830,8 +1990,10 @@ def _display_web_result(result) -> None:
 
     if result.vulnerabilities:
         console.print(f"  [red]Vulnerabilities: {len(result.vulnerabilities)}[/red]")
+        colors = {"critical": "red", "high": "orange3", "medium": "yellow", "low": "blue"}
         for vuln in result.vulnerabilities[:5]:
-            console.print(f"    [{vuln.severity}]{escape(vuln.name)}[/{vuln.severity}]")
+            color = colors.get(vuln.severity, "dim")
+            console.print(f"    [{color}]{escape(vuln.name)}[/{color}]")
 
     if result.discovered_directories:
         console.print(f"  [cyan]Directories found: {len(result.discovered_directories)}[/cyan]")

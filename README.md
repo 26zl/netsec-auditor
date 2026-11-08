@@ -30,14 +30,17 @@ recon, and wardrive-data import — and writes JSON / HTML / PDF reports.
   rules and per-scope port allow-lists and scan-rate limits.
 - Async port scanning (SYN / connect / UDP) with service and OS detection, plus
   fast connect-sweep discovery for large ranges.
-- **OT/ICS + IoT device identification** via read-only protocol probes (Modbus,
-  Siemens S7, EtherNet/IP, BACnet, DNP3, OPC-UA, MQTT, CoAP, UPnP/SSDP, mDNS,
-  RTSP) — see [Safety](#ot-safety) below.
+- **OT/ICS + IoT device identification** via read-only protocol probes for the
+  PLC, RTU and building-automation protocols common in enterprise plants, plus
+  MQTT, CoAP, UPnP/SSDP, mDNS and RTSP — see [OT coverage](#ot-coverage) and
+  [Safety](#ot-safety) below.
 - **Enterprise service checks:** SNMP default community strings (`public`/
   `private`), SMB dialect + **SMBv1/EternalBlue** detection and signing posture,
   and UDP amplification/reflector exposure (NTP monlist, memcached, chargen, SSDP).
-- **Passive discovery** (GRASSMARLIN-style sniffing) that sends zero packets —
-  ideal for fragile OT networks.
+- **Passive discovery** (GRASSMARLIN-style sniffing and pcap import) that sends
+  zero packets — ideal for fragile OT networks. It names OT protocols by port and
+  recognises layer-2 PROFINET, EtherCAT, POWERLINK and IEC 61850 GOOSE/SV
+  traffic, including PROFINET station names from DCP.
 - Vulnerability heuristics plus a built-in, customizable signature ruleset
   (`netsec_auditor/data/vuln-rules.yaml`), NVD CVE enrichment, and **CVE
   prioritization with EPSS + CISA KEV**.
@@ -57,6 +60,45 @@ set conservative timing, and an interlock automatically downgrades to the gentle
 OT profile (single-threaded, delayed, read-only) when an OT service is detected.
 All OT/IoT probes are read-only identification only; write/control functions are
 never sent.
+
+- `scan`, `vuln` and `full` add the OT/ICS ports to the default port list, so nmap
+  runs with polite timing (T2, one host at a time, no OS detection). An explicit
+  `--ports` list is used exactly as given.
+- `full` and `walk` send the OT UDP probes (BACnet, EtherNet/IP, KNX, FINS) first under the OT
+  profile; an OT answer keeps the rest of that host's probes gentle and skips the
+  SNMP community guesses and the amplification checks.
+- `vuln --nse` only checks the ports the scan found open, at the scope's rate, and
+  with polite timing whenever OT is involved.
+- HART-IP and PC Worx identification needs a short multi-message session, so it
+  only runs when the operator forces it with `identify --profile it`.
+
+## OT coverage
+
+| Protocol | Port | What `identify` / `full` / `walk` report |
+|---|---|---|
+| Siemens S7comm | 102/tcp | Module, order number, firmware (S7-300/400; S7-1200/1500 where S7comm is enabled) |
+| Modbus/TCP | 502/tcp | Vendor, product and revision (Read Device Identification) |
+| EtherNet/IP (CIP) | 44818/tcp+udp | Vendor, product name, revision, serial (Rockwell, Omron, ...) |
+| BACnet/IP | 47808/udp | Device instance and vendor ID |
+| DNP3 | 20000/tcp | Outstation link address |
+| OPC UA | 4840/tcp | Server presence and protocol version |
+| IEC 60870-5-104 | 2404/tcp | Presence (link test only; never STARTDT) |
+| Niagara Fox | 1911/tcp, 4911/tcp+TLS | Station, application, VM and OS names and versions |
+| KNXnet/IP | 3671/udp | Device name, KNX address, serial, MAC |
+| Omron FINS | 9600/udp | Controller model and version |
+| Beckhoff ADS | 48898/tcp | AMS NetId, device name and version (when an ADS route allows it) |
+| HART-IP | 5094/tcp | Device and manufacturer IDs, revisions (`--profile it` only) |
+| Phoenix Contact PC Worx | 1962/tcp | PLC type, model, firmware (`--profile it` only) |
+| GE SRTP | 18245/tcp | Presence |
+| CODESYS V2 runtime | 1200/tcp, 2455/tcp | Presence and target strings |
+
+`vuln --nse --nse-ics` adds nmap's modbus-discover, s7-info, bacnet-info, enip-info,
+omron-info, fox-info, knx-gateway-info and pcworx-info. Not covered: Mitsubishi
+MELSEC (MC/SLMP has no standard port and 5006/5007 speak the proprietary MELSOFT
+protocol), IEC 61850 MMS identification, DCS vendor protocols (Emerson, Honeywell,
+Yokogawa) and OPC Classic; mapping identified devices to ICS advisories is not
+automated. The GE SRTP and CODESYS framing follows published research and has not
+been checked against a real controller yet.
 
 ## Requirements
 
@@ -113,8 +155,8 @@ repository keeps one source of truth and means a release is just a tag.
 # With the optional extras (BLE + PDF)
 pipx install "netsec-auditor[all] @ git+https://github.com/26zl/netsec-auditor.git"
 
-# Pin to a released version
-pipx install git+https://github.com/26zl/netsec-auditor.git@v1.0.0
+# Pin to a released version (the command above tracks the main branch)
+pipx install git+https://github.com/26zl/netsec-auditor.git@v1.0.9
 
 # From a checkout
 pip install .
@@ -128,13 +170,14 @@ docker run --rm --net=host netsec-auditor:local scan 10.0.0.5 --scan-type connec
 Every [release](https://github.com/26zl/netsec-auditor/releases) also carries a
 built wheel and sdist if you would rather install the artifact directly.
 
-`scripts/install.sh` wraps the same command and adds an `nmap` check.
+`scripts/install.sh` installs the latest release with pipx (or `pip --user`) and
+checks for `nmap`; set `NETSEC_AUDITOR_REF` to install another tag.
 
 ## Usage
 
 ```bash
-# Port scan (unprivileged TCP connect scan)
-netsec-auditor scan 10.0.0.5 --ports common --scan-type connect
+# Port scan (unprivileged TCP connect scan) with JSON/HTML/PDF reports
+netsec-auditor scan 10.0.0.5 --scan-type connect --output ./reports
 
 # Host discovery on a network range
 netsec-auditor discover 192.168.1.0/24 --method both
@@ -175,6 +218,9 @@ netsec-auditor ble --duration 10
 netsec-auditor wardrive capture.wigle.csv --output ./reports
 netsec-auditor wardrive capture.wigle.csv --ssid ACME- --no-redact  # narrow + full detail
 
+# Offline capture analysis — host inventory and cleartext credentials (passwords redacted)
+netsec-auditor pcap capture.pcap
+
 # Walk-around audit — discover + scan + OT/IoT/SNMP + Wi-Fi/BLE → one report
 sudo netsec-auditor walk 192.168.1.0/24 --wifi --ble --output ./reports
 
@@ -189,7 +235,12 @@ netsec-auditor cve CVE-2021-44228
 ```
 
 Global flags: `-v/--verbose` for debug logging and `--json-logs` for structured
-JSON log output.
+JSON log output. Reports are written only when `--output` is given (or, for `scan`,
+`--format`). Targets may be IPs, CIDR ranges, hostnames, URLs or `host:port`.
+
+Exit codes: `0` success, `1` incomplete results (nmap could not scan a target, or
+an input file could not be read), `2` usage error (invalid option or an
+out-of-scope target).
 
 ## NetHunter / walk-around use
 
@@ -233,8 +284,9 @@ netsec-auditor doctor                    # confirm what's available
 Wi-Fi and wardrive captures record every network in range, most belonging to
 people who are not the audit subject. Reports therefore **redact by default**:
 BSSIDs and client MACs are truncated to their vendor OUI and GPS coordinates are
-rounded to ~1 km. Use `--no-redact` when the engagement covers the full detail,
-and `--ssid` on `wardrive` to import only the networks in question.
+rounded to ~1 km. Use `--no-redact` (on `wifi`, `wardrive` and `walk`) when the
+engagement covers the full detail, and `--ssid` on `wardrive` to import only the
+networks in question. Console tables are redacted the same way.
 
 `enrich <ip>` sends the address to Shodan InternetDB — a third party. Non-global
 addresses are never sent; public ones leave your network, so check that this is
@@ -258,10 +310,22 @@ scope authorizing exactly the targets given on the command line is used.
 
 ```bash
 pip install -e ".[dev]"
-pytest        # run the test suite
-ruff check .  # lint
-mypy .        # type-check
+pytest               # run the test suite
+ruff check .         # lint
+mypy netsec_auditor  # strict type check
 ```
+
+CI runs all three on Python 3.11 to 3.15, plus `pip-audit`, the locked versions in
+`uv.lock` and a Docker build. See [CONTRIBUTING.md](CONTRIBUTING.md) for the release
+process.
+
+## Third-party licenses
+
+netsec-auditor is MIT-licensed. It imports scapy (GPL-2.0-only) and python-nmap
+(GPL-3.0) at runtime and drives the nmap binary (Nmap Public Source License).
+Installing it from source or the release wheel does not redistribute them, but
+publishing a bundle that contains them, such as a Docker image, is a distribution
+of GPL and NPSL components and needs a licensing review first.
 
 ## License
 

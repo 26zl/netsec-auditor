@@ -17,6 +17,16 @@ class ScopeError(Exception):
     """Raised when a target falls outside the authorized scope."""
 
 
+_TARGET_LIST_FIELDS = (
+    "cidr_ranges",
+    "domains",
+    "ip_addresses",
+    "excluded_cidr_ranges",
+    "excluded_domains",
+    "excluded_ip_addresses",
+)
+
+
 @dataclass
 class Scope:
     """Defines the authorized scanning scope."""
@@ -43,8 +53,18 @@ class Scope:
     )
     _parsed_ips: set[str] = field(default_factory=set, init=False, repr=False)
     _parsed_excluded_ips: set[str] = field(default_factory=set, init=False, repr=False)
+    _excluded_name_ips: set[str] | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
+        # A YAML scalar where a list is expected would be iterated per character,
+        # which silently voids an exclusion such as "excluded_domains: prod.example.com".
+        for name in _TARGET_LIST_FIELDS:
+            value = getattr(self, name)
+            if value is None:
+                setattr(self, name, [])
+            elif not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+                raise ScopeError(f"{name} must be a list of strings")
+
         try:
             self._parsed_cidrs = [
                 ipaddress.ip_network(cidr, strict=False) for cidr in self.cidr_ranges
@@ -110,6 +130,9 @@ class Scope:
             if str(ip) in self._parsed_excluded_ips:
                 raise ScopeError(f"Target {target} ({ip}) is explicitly excluded")
 
+            if str(ip) in self._excluded_domain_addresses():
+                raise ScopeError(f"Target {target} ({ip}) is an address of an excluded domain")
+
         if self._domain_matches(host, self.domains):
             return list(ips)
 
@@ -139,7 +162,7 @@ class Scope:
             except TypeError:
                 continue
 
-        for excluded_ip in self._parsed_excluded_ips:
+        for excluded_ip in self._parsed_excluded_ips | self._excluded_domain_addresses():
             ip = ipaddress.ip_address(excluded_ip)
             try:
                 if ip in network:
@@ -177,12 +200,36 @@ class Scope:
             return True
         raise ScopeError(f"Port {port} is not in allowed ports: {self.allowed_ports}")
 
+    def _excluded_domain_addresses(self) -> set[str]:
+        """Addresses of the excluded hostnames, resolved once, so IP and range targets
+        cannot reach a host that is excluded by name; wildcards cannot be resolved."""
+        if self._excluded_name_ips is None:
+            addresses: set[str] = set()
+            for domain in self.excluded_domains:
+                name = domain.strip().rstrip(".")
+                if not name or name.startswith("*."):
+                    continue
+                try:
+                    addresses.update(str(ip) for ip in self._resolve_to_ips(name))
+                except ScopeError:
+                    continue
+            self._excluded_name_ips = addresses
+        return self._excluded_name_ips
+
     @staticmethod
     def _extract_host(target: str) -> str:
-        """Strip URL scheme/path, returning the bare host (or network) string."""
+        """Strip a URL scheme/path or a trailing :port, returning the bare host (or network)."""
         target = target.strip()
         if "://" in target:
             return urlparse(target).hostname or target
+        if target.startswith("[") and "]:" in target:  # [IPv6]:port
+            host, _, port = target[1:].partition("]:")
+            if port.isdigit():
+                return host
+        elif target.count(":") == 1:  # host:port (a bare IPv6 address has several colons)
+            host, _, port = target.partition(":")
+            if host and port.isdigit():
+                return host
         return target
 
     @staticmethod
@@ -259,21 +306,3 @@ class Scope:
             "authorization_date": self.authorization_date,
             "authorization_ref": self.authorization_ref,
         }
-
-
-class ScopeManager:
-    """Manages multiple scopes for different engagements."""
-
-    def __init__(self) -> None:
-        self._scopes: dict[str, Scope] = {}
-
-    def load_scope(self, path: Path) -> Scope:
-        scope = Scope.from_yaml(path)
-        self._scopes[scope.name] = scope
-        return scope
-
-    def get_scope(self, name: str) -> Scope | None:
-        return self._scopes.get(name)
-
-    def list_scopes(self) -> list[str]:
-        return list(self._scopes.keys())

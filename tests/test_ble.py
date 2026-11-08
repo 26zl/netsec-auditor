@@ -9,11 +9,14 @@ Bluetooth adapter or the network.
 
 from __future__ import annotations
 
+import asyncio
 import sys
+import time
 import types
 
 import pytest
 
+from netsec_auditor.wireless import ble
 from netsec_auditor.wireless.base import BleDevice, assess_ble_device
 from netsec_auditor.wireless.ble import (
     build_ble_device,
@@ -300,3 +303,30 @@ async def test_scan_ble_omits_adapter_when_none(
     calls = _install_fake_bleak(monkeypatch, discovered={})
     await scan_ble(duration=1.0)
     assert "adapter" not in calls
+
+
+async def test_scan_ble_gives_up_on_a_backend_that_never_returns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A wedged BlueZ/D-Bus call must not hang `ble` or `walk`.
+    monkeypatch.setattr(ble, "_SCAN_GRACE_SECONDS", 0.05)
+    cancelled: list[bool] = []
+
+    async def discover(**_kwargs: object) -> dict:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.append(True)
+            raise
+        return {}
+
+    scanner = type("BleakScanner", (), {"discover": staticmethod(discover)})
+    module = types.ModuleType("bleak")
+    module.BleakScanner = scanner
+    monkeypatch.setitem(sys.modules, "bleak", module)
+
+    started = time.monotonic()
+    assert await scan_ble(duration=0.05) == []
+    assert time.monotonic() - started < 1.0
+    await asyncio.sleep(0)  # let the abandoned scan observe its cancellation
+    assert cancelled == [True]

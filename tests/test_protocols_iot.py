@@ -8,7 +8,9 @@ so no test performs any real network I/O.
 from __future__ import annotations
 
 import asyncio
+import ssl
 import struct
+import time
 
 import pytest
 
@@ -116,10 +118,40 @@ def test_build_ssdp_msearch() -> None:
     req = build_ssdp_request()
     assert req.startswith(b"M-SEARCH * HTTP/1.1\r\n")
     assert b'MAN: "ssdp:discover"' in req
-    assert b"ST: ssdp:all" in req
+    assert b"ST: upnp:rootdevice" in req  # one reply per root device, not per service
     assert b"MX: 1" in req
     assert b"HOST: 239.255.255.250:1900" in req
     assert req.endswith(b"\r\n\r\n")
+
+
+def test_probe_ssdp_searches_for_root_devices_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    sent: list[bytes] = []
+
+    async def fake_udp(host: str, port: int, payload: bytes, timeout: float) -> bytes:
+        sent.append(payload)
+        return (
+            b"HTTP/1.1 200 OK\r\n"
+            b"LOCATION: http://10.0.0.1:49152/rootDesc.xml\r\n"
+            b"SERVER: Linux/5.4 UPnP/1.1 MiniUPnPd/2.2\r\n"
+            b"ST: upnp:rootdevice\r\n"
+            b"USN: uuid:1234::upnp:rootdevice\r\n"
+            b"\r\n"
+        )
+
+    monkeypatch.setattr(iot, "udp_request", fake_udp)
+    result = asyncio.run(iot.probe_ssdp("10.0.0.1", 1900, 0.1))
+    # ssdp:all draws a datagram per device and service: the reflector traffic now gated.
+    assert len(sent) == 1
+    assert b"ST: upnp:rootdevice\r\n" in sent[0]
+    assert b"ssdp:all" not in sent[0]
+    assert b"HOST: 10.0.0.1:1900\r\n" in sent[0]
+    assert result is not None
+    assert result.device_info == {
+        "server": "Linux/5.4 UPnP/1.1 MiniUPnPd/2.2",
+        "location": "http://10.0.0.1:49152/rootDesc.xml",
+        "usn": "uuid:1234::upnp:rootdevice",
+        "st": "upnp:rootdevice",
+    }
 
 
 def test_parse_ssdp_response_headers() -> None:
@@ -178,6 +210,19 @@ def test_parse_mdns_follows_compression_pointer() -> None:
     assert "_ipp._tcp.local" in info["services"]
 
 
+def test_parse_mdns_bounds_hostile_pointer_loops() -> None:
+    # A name that points back at its own start, referenced by many PTR answers, used to
+    # expand every name 128-fold (quadratic parse time and memory).
+    header = struct.pack("!HHHHHH", 0, 0x8400, 1, 200, 0, 0)
+    question = b"\x01a" * 100 + b"\xc0\x0c" + struct.pack("!HH", 12, 1)
+    answer = b"\xc0\x0c" + struct.pack("!HHIH", 12, 1, 0, 2) + b"\xc0\x0c"
+    started = time.perf_counter()
+    info = parse_mdns_response(header + question + answer * 200)
+    assert time.perf_counter() - started < 1.0
+    assert info["service_count"] == "64"
+    assert all(len(name) <= 255 for name in info["services"].split(", "))
+
+
 def test_parse_mdns_rejects_empty_and_no_answers() -> None:
     assert parse_mdns_response(b"\x00\x00") == {}  # too short
     assert parse_mdns_response(struct.pack("!HHHHHH", 0, 0, 0, 0, 0, 0)) == {}
@@ -232,8 +277,9 @@ def test_specs_are_iot_safe_and_registered() -> None:
 
 def test_probe_mqtt_wires_build_and_parse(monkeypatch: pytest.MonkeyPatch) -> None:
     async def fake_tcp(host: str, port: int, payload: bytes, timeout: float,
-                       recv_size: int = 4096) -> bytes:
+                       **kwargs: object) -> bytes:
         assert payload[0] == 0x10  # our CONNECT reached the transport
+        assert kwargs.get("ssl_context") is None  # plain MQTT on 1883
         return b"\x20\x02\x00\x00"  # CONNACK accepted
 
     monkeypatch.setattr(iot, "tcp_request", fake_tcp)
@@ -246,15 +292,42 @@ def test_probe_mqtt_wires_build_and_parse(monkeypatch: pytest.MonkeyPatch) -> No
     assert "tls" not in result.extra
 
 
-def test_probe_mqtt_marks_tls_on_8883(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def fake_tcp(host: str, port: int, payload: bytes, timeout: float,
-                       recv_size: int = 4096) -> bytes:
-        return b"\x20\x02\x00\x00"
+def test_mqtt_tls_spec_sends_connect_inside_tls(monkeypatch: pytest.MonkeyPatch) -> None:
+    opened: list[dict[str, object]] = []
+    written: list[bytes] = []
 
-    monkeypatch.setattr(iot, "tcp_request", fake_tcp)
-    result = asyncio.run(iot.probe_mqtt("10.0.0.1", 8883, 0.1))
+    class _Reader:
+        async def read(self, n: int) -> bytes:
+            return b"\x20\x02\x00\x00"
+
+    class _Writer:
+        def write(self, data: bytes) -> None:
+            written.append(data)
+
+        async def drain(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+        async def wait_closed(self) -> None:
+            return None
+
+    async def fake_open(host: str, port: int, **kwargs: object) -> tuple[_Reader, _Writer]:
+        opened.append(kwargs)
+        return _Reader(), _Writer()
+
+    monkeypatch.setattr(asyncio, "open_connection", fake_open)
+    spec = next(s for s in SPECS if s.name == "mqtt-tls")
+    result = asyncio.run(spec.probe("10.0.0.1", spec.default_port, 0.5))
+    # A plaintext CONNECT can never draw a CONNACK from a TLS listener.
+    context = opened[0].get("ssl")
+    assert isinstance(context, ssl.SSLContext)
+    assert context.verify_mode == ssl.CERT_NONE  # identification only, no trust decision
+    assert context.check_hostname is False
+    assert written == [build_mqtt_request()]
     assert result is not None
-    assert result.extra.get("tls") is True
+    assert result.extra["tls"] is True
 
 
 def test_probe_returns_none_without_data(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -2,20 +2,28 @@
 
 These parsers turn Wi-Fi captures exported by ESP32/Flipper-style gadgets (and
 Kismet) into :class:`AccessPoint` records so netsec-auditor can report on them.
-Every parser is pure and tolerant: it takes text, returns a list, skips
-malformed rows and never raises. All work here is read-only inventory — no
-attacks, deauth or handshake capture.
+The text parsers (:func:`parse_wigle_csv`, :func:`parse_gpx`,
+:func:`parse_kismet_netxml`) are pure and tolerant: they skip malformed rows and
+return an empty list for unparsable input. :func:`load_wardrive` streams a file
+from disk and raises :class:`WardriveFormatError` when it cannot be read or is
+not one of those formats. All work here is read-only inventory — no attacks,
+deauth or handshake capture.
 """
 
 from __future__ import annotations
 
+import codecs
 import csv
+import io
+import math
 import re
 import xml.etree.ElementTree as ET
+from collections.abc import Iterator
 from pathlib import Path
+from typing import IO
 
 from defusedxml.common import DefusedXmlException
-from defusedxml.ElementTree import fromstring as safe_fromstring
+from defusedxml.ElementTree import iterparse as safe_iterparse
 
 from netsec_auditor.utils.logging import get_logger
 from netsec_auditor.wireless.base import (
@@ -27,92 +35,251 @@ from netsec_auditor.wireless.base import (
 
 logger = get_logger(__name__)
 
+
+class WardriveFormatError(ValueError):
+    """A wardrive file cannot be read or is not a WiGLE CSV, GPX or Kismet netxml file."""
+
+
 # A colon- or dash-separated 48-bit MAC/BSSID.
 _MAC_RE = re.compile(r"(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}")
 
-# Leading XML declaration — stripped before parsing (see _parse_xml).
-_XML_DECL_RE = re.compile(r"<\?xml[^>]*\?>", re.IGNORECASE)
+# The encoding named by a leading XML declaration.
+_XML_ENCODING_RE = re.compile(rb"""\s*<\?xml[^>]*?encoding\s*=\s*["']([A-Za-z0-9._-]{1,40})["']""")
+
+# Characters XML 1.0 forbids: one raw control byte copied from an SSID would
+# otherwise make an entire GPX/Kismet export unparsable.
+_XML_INVALID_CHARS: dict[int, None] = dict.fromkeys(
+    [*range(0x00, 0x09), 0x0B, 0x0C, *range(0x0E, 0x20), 0xFFFE, 0xFFFF]
+)
 
 # OWE as a whole token, so free-text descriptions ("tower", "power") do not match.
 _OWE_RE = re.compile(r"\bOWE\b")
 
+# Rows searched for the WiGLE column header (normally the second line).
+_HEADER_SEARCH_ROWS = 16
+# Bytes read up front to recognise a file whose extension says nothing.
+_SNIFF_BYTES = 4096
+
 
 def parse_wigle_csv(text: str) -> list[AccessPoint]:
-    """Parse a WiGLE CSV export (pre-header + header + rows). WIFI rows only."""
-    aps: list[AccessPoint] = []
+    """Parse a WiGLE CSV export (pre-header + header + rows). WIFI rows only.
+
+    Never raises: text that is not a WiGLE CSV yields ``[]``.
+    """
     try:
-        rows = list(csv.reader(text.splitlines()))
-    except csv.Error as exc:  # e.g. a field beyond csv's 128 KiB limit
-        logger.warning("wardrive_csv_unparsable", error=str(exc))
-        return aps
-    header_idx = _find_wigle_header(rows)
-    if header_idx < 0:
-        return aps
-    header = [cell.strip() for cell in rows[header_idx]]
-    for raw in rows[header_idx + 1:]:
-        ap = _wigle_row_to_ap(header, raw)
-        if ap is not None:
-            aps.append(ap)
-    return aps
+        # splitlines() also splits on \x1c, \x0b and U+2028, letting a crafted SSID hide its row.
+        return _read_wigle_csv(io.StringIO(text, newline=""))
+    except WardriveFormatError as exc:
+        logger.debug("wardrive_unparsable", format="wigle-csv", error=str(exc))
+        return []
 
 
 def parse_gpx(text: str) -> list[AccessPoint]:
-    """Parse GPX ``<wpt>`` waypoints, reading BSSID/security from desc/cmt."""
+    """Parse GPX ``<wpt>`` waypoints, reading BSSID/security from desc/cmt.
+
+    Never raises: text that is not a GPX document yields ``[]``.
+    """
+    try:
+        return _read_gpx(_XmlText(io.StringIO(text)))
+    except WardriveFormatError as exc:
+        logger.debug("wardrive_unparsable", format="gpx", error=str(exc))
+        return []
+
+
+def parse_kismet_netxml(text: str) -> list[AccessPoint]:
+    """Parse Kismet ``.netxml`` ``<wireless-network>`` elements.
+
+    Never raises: text that is not a Kismet netxml document yields ``[]``.
+    """
+    try:
+        return _read_kismet(_XmlText(io.StringIO(text)))
+    except WardriveFormatError as exc:
+        logger.debug("wardrive_unparsable", format="kismet", error=str(exc))
+        return []
+
+
+def load_wardrive(path: Path) -> list[AccessPoint]:
+    """Stream a wardrive file, dispatching by extension or, failing that, by content.
+
+    The file is parsed incrementally, so memory tracks the access points found
+    rather than the file size. Returns ``[]`` for a valid file that holds no
+    access points. Raises :class:`WardriveFormatError` when the file cannot be
+    read or is not a WiGLE CSV, GPX or Kismet netxml file.
+    """
+    path = Path(path)
+    try:
+        if not path.exists():
+            raise WardriveFormatError("file not found")
+        if not path.is_file():  # a FIFO or device could block or never end
+            raise WardriveFormatError("not a regular file")
+        with path.open("rb") as raw:
+            head = raw.read(_SNIFF_BYTES)
+            raw.seek(0)
+            kind = _format_for(path.suffix.lower(), head)
+            if kind == "csv":
+                return _read_wigle_csv(_text_stream(raw, head, xml=False))
+            if kind == "gpx":
+                return _read_gpx(_XmlText(_text_stream(raw, head, xml=True)))
+            if kind == "kismet":
+                return _read_kismet(_XmlText(_text_stream(raw, head, xml=True)))
+    except OSError as exc:
+        raise WardriveFormatError(f"cannot read file: {exc.strerror or exc}") from exc
+    raise WardriveFormatError("unrecognised format: expected WiGLE CSV, GPX or Kismet netxml")
+
+
+# Streaming readers
+
+
+def _read_wigle_csv(stream: IO[str]) -> list[AccessPoint]:
+    """Read WiGLE CSV rows one at a time, skipping malformed ones."""
+    reader = csv.reader(stream)
+    header: list[str] | None = None
     aps: list[AccessPoint] = []
-    root = _parse_xml(text)
-    if root is None:
-        return aps
-    for wpt in root.iter():
-        if _localname(wpt.tag) != "wpt":
-            continue
+    try:
+        for index, raw in enumerate(reader):
+            if header is None:
+                if _is_wigle_header(raw):
+                    header = [cell.strip() for cell in raw]
+                elif index >= _HEADER_SEARCH_ROWS:
+                    break
+                continue
+            ap = _wigle_row_to_ap(header, raw)
+            if ap is not None:
+                aps.append(ap)
+    except csv.Error as exc:  # e.g. a field beyond csv's 128 KiB limit
+        raise WardriveFormatError(f"unparsable CSV: {exc}") from exc
+    if header is None:
+        raise WardriveFormatError("no WiGLE CSV header (MAC, SSID, AuthMode) found")
+    return aps
+
+
+def _read_gpx(source: _XmlText) -> list[AccessPoint]:
+    """Convert each GPX waypoint as soon as it has been parsed."""
+    aps: list[AccessPoint] = []
+    for wpt in _iter_elements(source, roots=("gpx",), target="wpt"):
         ap = _gpx_waypoint_to_ap(wpt)
         if ap is not None:
             aps.append(ap)
     return aps
 
 
-def parse_kismet_netxml(text: str) -> list[AccessPoint]:
-    """Parse Kismet ``.netxml`` ``<wireless-network>`` elements."""
+def _read_kismet(source: _XmlText) -> list[AccessPoint]:
+    """Convert each Kismet ``<wireless-network>`` as soon as it has been parsed."""
     aps: list[AccessPoint] = []
-    root = _parse_xml(text)
-    if root is None:
-        return aps
-    for net in root.iter():
-        if _localname(net.tag) != "wireless-network":
-            continue
+    roots = ("detection-run", "wireless-network")
+    for net in _iter_elements(source, roots=roots, target="wireless-network"):
         ap = _kismet_network_to_ap(net)
         if ap is not None:
             aps.append(ap)
     return aps
 
 
-def load_wardrive(path: Path) -> list[AccessPoint]:
-    """Read a capture file and dispatch by extension, sniffing content if unknown."""
-    path = Path(path)
+class _XmlText:
+    """Text source for ``iterparse`` that drops characters XML 1.0 forbids.
+
+    Leading whitespace and a BOM are skipped so the XML declaration, if any,
+    starts the document as expat requires.
+    """
+
+    def __init__(self, stream: IO[str]) -> None:
+        self._stream = stream
+        self._started = False
+
+    def read(self, size: int = -1) -> str:
+        data = self._stream.read(size)
+        while not self._started and data:
+            data = data.lstrip("\ufeff \t\r\n")
+            if data:
+                self._started = True
+            else:
+                data = self._stream.read(size)
+        return data.translate(_XML_INVALID_CHARS)
+
+
+def _iter_elements(
+    source: _XmlText, roots: tuple[str, ...], target: str
+) -> Iterator[ET.Element]:
+    """Yield each complete ``target`` element and drop every finished subtree.
+
+    defusedxml rejects entity declarations and external references (XXE,
+    billion laughs); a bare DOCTYPE is accepted but never fetched.
+    """
+    stack: list[ET.Element] = []
+    inside = 0  # open ``target`` elements around the current position
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return []
-    suffix = path.suffix.lower()
+        for event, elem in safe_iterparse(source, events=("start", "end")):
+            name = _localname(elem.tag)
+            if event == "start":
+                if not stack and name not in roots:
+                    raise WardriveFormatError(f"unexpected root element <{name}>")
+                stack.append(elem)
+                if name == target:
+                    inside += 1
+                continue
+            stack.pop()
+            if name == target:
+                inside -= 1
+                yield elem
+            if inside == 0 and stack:
+                stack[-1].remove(elem)
+    except (ET.ParseError, DefusedXmlException) as exc:
+        raise WardriveFormatError(f"malformed XML: {exc}") from exc
+
+
+def _text_stream(raw: io.BufferedReader, head: bytes, *, xml: bool) -> IO[str]:
+    """Decode ``raw`` leniently: UTF-8, UTF-16 with a BOM, or the declared XML encoding."""
+    encoding = "utf-8-sig"
+    if head.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        encoding = "utf-16"
+    elif xml and (declared := _XML_ENCODING_RE.match(head)):
+        encoding = declared.group(1).decode("ascii")
+    try:
+        return io.TextIOWrapper(raw, encoding=encoding, errors="replace", newline="")
+    except LookupError:  # unknown or non-text codec named by the file
+        return io.TextIOWrapper(raw, encoding="utf-8-sig", errors="replace", newline="")
+
+
+def _format_for(suffix: str, head: bytes) -> str | None:
+    """Pick the parser from the extension, else from the first bytes of content."""
     if suffix == ".csv":
-        return parse_wigle_csv(text)
+        return "csv"
     if suffix == ".gpx":
-        return parse_gpx(text)
+        return "gpx"
     if suffix in (".netxml", ".xml"):
-        return parse_kismet_netxml(text)
-    return _sniff_and_parse(text)
+        return "kismet"
+    is_utf16 = head.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE))
+    text = head.decode("utf-16" if is_utf16 else "utf-8-sig", "replace")
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    for line in lines[:10]:
+        low = line.lower()
+        if line.startswith("WigleWifi") or (line.startswith("MAC,") and "authmode" in low):
+            return "csv"
+        if low.startswith("<gpx"):
+            return "gpx"
+        if low.startswith(("<detection-run", "<wireless-network")):
+            return "kismet"
+    start = text[:512].lower()
+    if "<gpx" in start:
+        return "gpx"
+    if "<detection-run" in start or "<wireless-network" in start:
+        return "kismet"
+    return None
 
 
 # WiGLE helpers
 
 
-def _find_wigle_header(rows: list[list[str]]) -> int:
-    """Return the index of the real column header row, or -1 if absent."""
-    for i, row in enumerate(rows):
-        cells = {cell.strip().upper() for cell in row}
-        if {"MAC", "SSID", "AUTHMODE"} <= cells:
-            return i
-    return -1
+def _is_wigle_header(row: list[str]) -> bool:
+    """True for the real column header row."""
+    return {"MAC", "SSID", "AUTHMODE"} <= {cell.strip().upper() for cell in row}
+
+
+def _normalize_mac(value: str) -> str:
+    """Return ``value`` as an upper-case colon-separated MAC, or '' if it is not one."""
+    candidate = value.strip()
+    if not _MAC_RE.fullmatch(candidate):
+        return ""
+    return candidate.replace("-", ":").upper()
 
 
 def _wigle_row_to_ap(header: list[str], raw: list[str]) -> AccessPoint | None:
@@ -120,7 +287,7 @@ def _wigle_row_to_ap(header: list[str], raw: list[str]) -> AccessPoint | None:
     row = {k.strip().upper(): (v or "").strip() for k, v in zip(header, raw, strict=False)}
     if row.get("TYPE", "").upper() != "WIFI":
         return None
-    bssid = row.get("MAC", "")
+    bssid = _normalize_mac(row.get("MAC", ""))
     if not bssid:
         return None
     enc, cipher, auth, wps = _classify_security(row.get("AUTHMODE", ""))
@@ -147,7 +314,11 @@ def _wigle_row_to_ap(header: list[str], raw: list[str]) -> AccessPoint | None:
 
 
 def _gpx_waypoint_to_ap(wpt: ET.Element) -> AccessPoint | None:
-    """Convert a GPX waypoint into an AccessPoint keyed by BSSID or name."""
+    """Convert a GPX waypoint into an AccessPoint.
+
+    The BSSID comes only from a MAC address in ``<desc>``/``<cmt>``; a waypoint
+    without one keeps an empty BSSID rather than borrowing its (SSID) name.
+    """
     name = desc = cmt = ""
     for child in wpt:
         value = (child.text or "").strip()
@@ -160,13 +331,14 @@ def _gpx_waypoint_to_ap(wpt: ET.Element) -> AccessPoint | None:
             cmt = value
     meta = " ".join(part for part in (desc, cmt) if part)
     match = _MAC_RE.search(meta)
-    bssid = match.group(0) if match else name
-    if not bssid:
+    bssid = _normalize_mac(match.group(0)) if match else ""
+    ssid = sanitize_name(name)
+    if not bssid and not ssid:
         return None
     enc, cipher, auth, wps = _classify_security(meta)
     ap = AccessPoint(
         bssid=bssid,
-        ssid=sanitize_name(name),
+        ssid=ssid,
         encryption=enc,
         cipher=cipher,
         auth=auth,
@@ -181,7 +353,7 @@ def _gpx_waypoint_to_ap(wpt: ET.Element) -> AccessPoint | None:
 
 def _kismet_network_to_ap(net: ET.Element) -> AccessPoint | None:
     """Convert a Kismet ``<wireless-network>`` element into an AccessPoint."""
-    bssid = _child_text(net, "BSSID")
+    bssid = _normalize_mac(_child_text(net, "BSSID"))
     if not bssid:
         return None
     ssid = ""
@@ -206,32 +378,13 @@ def _kismet_network_to_ap(net: ET.Element) -> AccessPoint | None:
         cipher=cipher,
         auth=auth,
         wps=wps,
-        vendor=_child_text(net, "manuf"),
+        vendor=sanitize_name(_child_text(net, "manuf")),
         latitude=lat,
         longitude=lon,
         source="kismet",
     )
     ap.issues = assess_access_point(ap)
     return ap
-
-
-def _sniff_and_parse(text: str) -> list[AccessPoint]:
-    """Fallback dispatch by inspecting the first lines / prefix of the content."""
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    for line in lines[:10]:
-        low = line.lower()
-        if line.startswith("WigleWifi") or (line.startswith("MAC,") and "authmode" in low):
-            return parse_wigle_csv(text)
-        if low.startswith("<gpx"):
-            return parse_gpx(text)
-        if low.startswith(("<detection-run", "<wireless-network")):
-            return parse_kismet_netxml(text)
-    head = text[:512].lower()
-    if "<gpx" in head:
-        return parse_gpx(text)
-    if "<detection-run" in head or "<wireless-network" in head:
-        return parse_kismet_netxml(text)
-    return []
 
 
 # Shared parsing primitives
@@ -278,22 +431,6 @@ def _classify_security(raw: str) -> tuple[str, str, str, bool]:
     return encryption, cipher, auth, wps
 
 
-def _parse_xml(text: str) -> ET.Element | None:
-    """Parse XML text, stripping any declaration/DOCTYPE; None on failure."""
-    cleaned = text.lstrip("\ufeff")  # drop a leading UTF-8 BOM if present
-    # Only the declaration is stripped; fromstring rejects a str carrying an
-    # encoding declaration. The DOCTYPE is left for defusedxml to reject.
-    cleaned = _XML_DECL_RE.sub("", cleaned, count=1)
-    cleaned = cleaned.strip()
-    if not cleaned:
-        return None
-    try:
-        # defusedxml forbids DTDs/entities (XXE, billion-laughs) in operator files.
-        return safe_fromstring(cleaned)
-    except (ET.ParseError, DefusedXmlException):
-        return None
-
-
 def _localname(tag: object) -> str:
     """Return an element's namespace-stripped local name."""
     if not isinstance(tag, str):
@@ -323,16 +460,17 @@ def _to_int(value: str | None) -> int:
     """Parse an int (via float, tolerating decimals); 0 on failure."""
     try:
         return int(float(value))  # type: ignore[arg-type]
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):  # OverflowError: "inf", "1e999"
         return 0
 
 
 def _to_float(value: str | None) -> float | None:
-    """Parse a float; None on failure (used for optional lat/lon)."""
+    """Parse a finite float; None on failure (used for optional lat/lon)."""
     try:
-        return float(value)  # type: ignore[arg-type]
+        number = float(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
+    return number if math.isfinite(number) else None
 
 
 def _to_coord(value: str | None, limit: float) -> float | None:

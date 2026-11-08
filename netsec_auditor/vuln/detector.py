@@ -3,19 +3,22 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib.resources
 import json
 import re
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import yaml
 
 from netsec_auditor.scanner.engine import HostResult, ServiceInfo
+from netsec_auditor.utils.files import write_json_atomic
 from netsec_auditor.utils.hashing import short_id
 from netsec_auditor.utils.logging import get_logger
 
@@ -396,12 +399,27 @@ class CVEQueryClient:
     """Query NVD and other CVE databases for vulnerability intelligence."""
 
     NVD_API_BASE = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+    # NVD allows 5 requests per 30 s without an API key and 50 with one.
+    PACE_WITHOUT_KEY = 6.0
+    PACE_WITH_KEY = 0.6
 
     def __init__(self, api_key: str = "", cache_dir: Path | None = None) -> None:
         self.api_key = api_key
         self.cache_dir = cache_dir or Path.home() / ".netsec-auditor" / "cve-cache"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._client = httpx.AsyncClient(timeout=30.0)
+        self._pace_lock = asyncio.Lock()
+        self._next_request = 0.0
+
+    async def _pace(self) -> None:
+        """Space requests to stay inside NVD's rolling rate limit."""
+        interval = self.PACE_WITH_KEY if self.api_key else self.PACE_WITHOUT_KEY
+        async with self._pace_lock:
+            now = time.monotonic()
+            if self._next_request > now:
+                await asyncio.sleep(self._next_request - now)
+                now = time.monotonic()
+            self._next_request = now + interval
 
     async def search_cve(self, keyword: str, limit: int = 20) -> list[dict[str, Any]]:
         """Search CVEs by keyword (product name, vendor, etc.)."""
@@ -444,6 +462,7 @@ class CVEQueryClient:
         headers = {"apiKey": self.api_key} if self.api_key else {}
         delay = 6.0  # NVD asks unauthenticated clients to stay well under 5 req / 30 s
         for _attempt in range(3):
+            await self._pace()
             try:
                 response = await self._client.get(
                     self.NVD_API_BASE, params=params, headers=headers
@@ -453,21 +472,12 @@ class CVEQueryClient:
                     delay *= 2
                     continue
                 response.raise_for_status()
-                return response.json()
-            except httpx.HTTPError as e:
+                return cast(dict[str, Any], response.json())
+            except (httpx.HTTPError, ValueError) as e:  # ValueError: a non-JSON body
                 logger.error("nvd_request_failed", error=str(e))
                 return None
         logger.error("nvd_rate_limited")
         return None
-
-    async def get_cves_for_product(
-        self, product: str, version: str = ""
-    ) -> list[dict[str, Any]]:
-        """Get CVEs for a specific product and version."""
-        query = product
-        if version:
-            query = f"{product} {version}"
-        return await self.search_cve(query)
 
     def _parse_nvd_response(self, data: dict[str, Any]) -> list[dict[str, Any]]:
         results = []
@@ -481,10 +491,12 @@ class CVEQueryClient:
             )
 
             metrics = cve.get("metrics", {})
-            cvss_v31 = metrics.get("cvssMetricV31", [{}])[0]
-            cvss_v30 = metrics.get("cvssMetricV30", [{}])[0]
-
-            cvss_data = cvss_v31.get("cvssData", {}) or cvss_v30.get("cvssData", {})
+            # Prefer CVSS v3.x; recent CVEs may carry only v4.0 and old ones only v2.
+            cvss_data: dict[str, Any] = {}
+            for key in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV40", "cvssMetricV2"):
+                cvss_data = (metrics.get(key) or [{}])[0].get("cvssData", {})
+                if cvss_data:
+                    break
             base_score = cvss_data.get("baseScore", 0.0)
             vector = cvss_data.get("vectorString", "")
 
@@ -517,19 +529,15 @@ class CVEQueryClient:
         cache_file = self.cache_dir / f"{key}.json"
         if cache_file.exists():
             try:
-                with open(cache_file) as f:
-                    return json.load(f)
+                with open(cache_file, encoding="utf-8") as f:
+                    return cast(list[dict[str, Any]], json.load(f))
             except (json.JSONDecodeError, OSError):
                 return None
         return None
 
     def _save_cache(self, key: str, data: list[dict[str, Any]]) -> None:
-        cache_file = self.cache_dir / f"{key}.json"
-        try:
-            with open(cache_file, "w") as f:
-                json.dump(data, f, indent=2)
-        except OSError:
-            pass
+        with contextlib.suppress(OSError):
+            write_json_atomic(self.cache_dir / f"{key}.json", data)
 
     async def close(self) -> None:
         await self._client.aclose()

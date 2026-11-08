@@ -13,6 +13,7 @@ import asyncio
 import contextlib
 import ssl
 import warnings
+from typing import TypedDict
 
 from netsec_auditor.utils.logging import get_logger
 
@@ -38,6 +39,14 @@ _CIPHER_REMEDIATION = (
     "Disable weak ciphers (RC4, 3DES, DES, NULL, EXPORT, MD5); require TLS 1.2+ "
     "AEAD suites such as AES-GCM or ChaCha20-Poly1305."
 )
+
+
+class TlsScan(TypedDict):
+    """Result of :func:`scan_tls`; empty collections when no TLS service answered."""
+
+    protocols: dict[str, bool | None]
+    weak_ciphers: list[str]
+    findings: list[dict[str, str]]
 
 
 def _finding(
@@ -249,7 +258,7 @@ async def scan_tls(
     port: int = 443,
     timeout: float = 10.0,
     connect_host: str | None = None,
-) -> dict[str, object]:
+) -> TlsScan:
     """Scan a host's TLS protocol versions and weak-cipher acceptance.
 
     Returns ``{"protocols": {...}, "weak_ciphers": [...], "findings": [...]}``.

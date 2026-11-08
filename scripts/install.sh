@@ -2,25 +2,37 @@
 #
 # netsec-auditor installer.
 #
-# Installs the `netsec-auditor` CLI from the Git repository (it is not on PyPI),
-# preferring pipx (isolated, PEP 668-safe) and falling back to
-# `pip install --user`. Idempotent: safe to re-run to upgrade. Also checks for
-# the `nmap` runtime dependency and prints an OS-specific install hint if it is
-# missing.
+# Installs a released version of the `netsec-auditor` CLI from the Git repository
+# (it is not on PyPI), preferring pipx (isolated, PEP 668-safe) and falling back to
+# `pip install --user`. Idempotent: safe to re-run. Also checks for the `nmap`
+# runtime dependency and prints an OS-specific install hint if it is missing.
 #
 # Usage:
 #   ./scripts/install.sh
-#   curl -fsSL https://raw.githubusercontent.com/26zl/netsec-auditor/main/scripts/install.sh | bash
+#   NETSEC_AUDITOR_REF=v1.0.9 ./scripts/install.sh   # another tag, or "main"
 #
 set -euo pipefail
 
-PACKAGE="git+https://github.com/26zl/netsec-auditor.git"
+# The release workflow checks that this default matches the tag being published.
+REF="${NETSEC_AUDITOR_REF:-v1.0.9}"
+PACKAGE="git+https://github.com/26zl/netsec-auditor.git@${REF}"
 BINARY="netsec-auditor"
 
-info() { printf '\033[0;34m==>\033[0m %s\n' "$1"; }
-warn() { printf '\033[0;33mwarn:\033[0m %s\n' "$1" >&2; }
-err()  { printf '\033[0;31merror:\033[0m %s\n' "$1" >&2; }
+if [[ -t 2 && -z "${NO_COLOR:-}" ]]; then
+  BLUE=$'\033[0;34m' YELLOW=$'\033[0;33m' RED=$'\033[0;31m' RESET=$'\033[0m'
+else
+  BLUE="" YELLOW="" RED="" RESET=""
+fi
+
+info() { printf '%s==>%s %s\n' "$BLUE" "$RESET" "$1"; }
+warn() { printf '%swarn:%s %s\n' "$YELLOW" "$RESET" "$1" >&2; }
+err()  { printf '%serror:%s %s\n' "$RED" "$RESET" "$1" >&2; }
 have() { command -v "$1" >/dev/null 2>&1; }
+
+if [[ ! "$REF" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+  err "NETSEC_AUDITOR_REF must be a tag or branch name, got: $REF"
+  exit 1
+fi
 
 nmap_hint() {
   case "$(uname -s)" in
@@ -50,9 +62,9 @@ check_nmap() {
 install_with_pipx() {
   info "Installing ${PACKAGE} with pipx (isolated)..."
   # pipx install fails if it is already installed. "pipx upgrade" takes a package
-  # name rather than a URL, so reinstall to pick up the newer revision.
+  # name rather than a URL, so reinstall to pick up the requested ref.
   if ! pipx install "${PACKAGE}"; then
-    info "already installed via pipx — reinstalling to upgrade..."
+    info "already installed via pipx — reinstalling ${REF}..."
     pipx install --force "${PACKAGE}"
   fi
   pipx ensurepath >/dev/null 2>&1 || true

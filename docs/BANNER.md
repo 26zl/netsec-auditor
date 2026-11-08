@@ -23,9 +23,8 @@ README embeds **images** instead of live ASCII:
 # crisp shield
 rsvg-convert -w 400 -h 467 docs/logo.svg -o docs/logo.png
 
-# slant wordmark rendered as an image with tight (terminal-like) line-height,
-# so the letters stay connected — see the generator that writes docs/wordmark.svg,
-# then rasterize it:
+# docs/wordmark.svg holds the figlet slant wordmark as SVG text with a tight
+# (terminal-like) line-height, so the letters stay connected
 rsvg-convert -w 2040 docs/wordmark.svg -o docs/wordmark.png
 ```
 

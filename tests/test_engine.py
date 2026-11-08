@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 
 from netsec_auditor.scanner.engine import (
     NetworkDiscovery,
@@ -119,3 +120,35 @@ def test_scan_host_hands_nmap_the_scope_validated_ip(monkeypatch) -> None:
     # nmap gets the validated address, never a hostname it could re-resolve.
     assert scanned == ["10.0.0.1"]
     assert result.ip == "10.0.0.1"
+
+
+def test_nmap_kill_switch_scales_with_the_range_and_polite_timing() -> None:
+    # One nmap process scans a whole CIDR, so a flat 60 s budget killed busy /24s.
+    from netsec_auditor.profiles import OT_PORTS
+    from netsec_auditor.scanner.engine import COMMON_PORTS, PortScanner
+    from netsec_auditor.scanner.scope import Scope
+
+    budgets: dict[str, float] = {}
+
+    class FakePortScanner:
+        def scan(self, hosts: str, ports: str, arguments: str, timeout: float) -> None:
+            budgets[hosts] = timeout
+
+        def all_hosts(self) -> list[str]:
+            return []
+
+    import nmap
+
+    original = nmap.PortScanner
+    nmap.PortScanner = FakePortScanner  # type: ignore[misc]
+    try:
+        scanner = PortScanner(Scope(name="t", cidr_ranges=["10.0.0.0/24"]))
+        ports = sorted(set(COMMON_PORTS) | OT_PORTS)
+        asyncio.run(scanner.scan_network(["10.0.0.5", "10.0.0.0/24"], ports=ports))
+    finally:
+        nmap.PortScanner = original  # type: ignore[misc]
+
+    probes = len(ports) * 3  # max_retries=2
+    single = 60 + probes * 0.4 + probes / 100  # T2 spacing plus the scope's --max-rate 100
+    assert budgets["10.0.0.5"] == math.ceil(single)
+    assert budgets["10.0.0.0/24"] == math.ceil(256 * single)

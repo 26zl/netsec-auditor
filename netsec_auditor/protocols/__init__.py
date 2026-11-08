@@ -1,6 +1,6 @@
 """Protocol probe registry — aggregates OT/ICS and IoT probe specs."""
 
-from netsec_auditor.protocols import amplification, iot, ot, smb, snmp
+from netsec_auditor.protocols import amplification, ics, iot, ot, smb, snmp
 from netsec_auditor.protocols.base import (
     ProbeResult,
     ProbeSpec,
@@ -11,6 +11,7 @@ from netsec_auditor.protocols.base import (
 )
 
 register(ot.SPECS)
+register(ics.SPECS)
 register(iot.SPECS)
 register(snmp.SPECS)
 register(amplification.SPECS)

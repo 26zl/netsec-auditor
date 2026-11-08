@@ -10,12 +10,20 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ssl
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from typing import Any
 
 Prober = Callable[[str, int, float], Awaitable["ProbeResult | None"]]
 # Maps the bytes received so far to the full frame size, or None while undetermined.
 FrameLength = Callable[[bytes], "int | None"]
+# Builds a request from the connected socket's local and remote (host, port), for
+# protocols whose request must carry the client's own address.
+RequestBuilder = Callable[[tuple[str, int], tuple[str, int]], bytes]
+
+# Identification replies are a few hundred bytes; a peer declaring more is not believed.
+MAX_FRAME_BYTES = 64 * 1024
 
 
 @dataclass
@@ -89,52 +97,71 @@ async def read_framed(
     timeout: float,
     frame_length: FrameLength | None = None,
     recv_size: int = 4096,
+    max_bytes: int = MAX_FRAME_BYTES,
 ) -> bytes:
-    """Read until ``frame_length`` is satisfied, EOF, or ``timeout`` expires.
+    """Read until ``frame_length`` is satisfied, EOF, ``max_bytes``, or ``timeout``.
 
     A single ``StreamReader.read`` returns as soon as any bytes arrive, so a
     segmented reply would otherwise be handed to the parsers as a truncated PDU.
+    The declared size is read once, as soon as the header is complete, and never
+    more than ``max_bytes`` is buffered however large a frame the peer claims.
     Whatever arrived before the timeout is still returned; parsers reject a short
     frame themselves.
     """
     buf = bytearray()
+    want: int | None = None
     with contextlib.suppress(TimeoutError):
         async with asyncio.timeout(timeout):
-            while True:
-                chunk = await reader.read(recv_size)
+            while len(buf) < max_bytes:
+                chunk = await reader.read(min(recv_size, max_bytes - len(buf)))
                 if not chunk:
                     break
                 buf += chunk
                 if frame_length is None:
                     break
-                want = frame_length(bytes(buf))
-                if want is None or len(buf) >= want:
+                if want is None:
+                    want = frame_length(bytes(buf))
+                if want is not None and len(buf) >= want:
                     break
     return bytes(buf)
+
+
+def _endpoints(get_extra_info: Callable[[str], Any]) -> tuple[tuple[str, int], tuple[str, int]]:
+    """The (host, port) of both ends of a connected transport."""
+    local, remote = get_extra_info("sockname"), get_extra_info("peername")
+    return (str(local[0]), int(local[1])), (str(remote[0]), int(remote[1]))
 
 
 async def tcp_request(
     host: str,
     port: int,
-    payload: bytes,
+    payload: bytes | RequestBuilder,
     timeout: float,
     recv_size: int = 4096,
     frame_length: FrameLength | None = None,
+    ssl_context: ssl.SSLContext | None = None,
 ) -> bytes | None:
-    """Send ``payload`` over TCP and return the reply, or None.
+    """Send ``payload`` over TCP (TLS when ``ssl_context`` is given) and return the reply.
 
+    ``payload`` may be a :data:`RequestBuilder`, called once the connection exists.
     Without ``frame_length`` a single read is returned; with it, reads continue
-    until the protocol's own length prefix is satisfied.
+    until the protocol's own length prefix is satisfied. Returns None on failure.
     """
-    try:
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port), timeout
+    if ssl_context is None:
+        connect = asyncio.open_connection(host, port)
+    else:
+        # Bound the close_notify exchange too, or a silent peer stalls the close.
+        connect = asyncio.open_connection(
+            host, port, ssl=ssl_context, ssl_shutdown_timeout=timeout
         )
+    try:
+        reader, writer = await asyncio.wait_for(connect, timeout)
     except (TimeoutError, ConnectionError, OSError):
         return None
     try:
-        if payload:
-            writer.write(payload)
+        request = payload(*_endpoints(writer.get_extra_info)) if callable(payload) else payload
+        if request:
+            writer.write(request)
             await writer.drain()
         return await read_framed(reader, timeout, frame_length, recv_size)
     except (TimeoutError, ConnectionError, OSError):
@@ -146,9 +173,12 @@ async def tcp_request(
 
 
 async def udp_request(
-    host: str, port: int, payload: bytes, timeout: float
+    host: str, port: int, payload: bytes | RequestBuilder, timeout: float
 ) -> bytes | None:
-    """Send ``payload`` over UDP and return the first datagram received, or None."""
+    """Send ``payload`` over UDP and return the first datagram received, or None.
+
+    ``payload`` may be a :data:`RequestBuilder`, called once the socket is connected.
+    """
     loop = asyncio.get_running_loop()
     fut: asyncio.Future[bytes] = loop.create_future()
 
@@ -169,7 +199,8 @@ async def udp_request(
     except (TimeoutError, OSError):
         return None
     try:
-        transport.sendto(payload)
+        request = payload(*_endpoints(transport.get_extra_info)) if callable(payload) else payload
+        transport.sendto(request)
         return await asyncio.wait_for(fut, timeout)
     except (TimeoutError, OSError):
         return None

@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import tracemalloc
+
+import pytest
+
+from netsec_auditor.wireless import wigle
 from netsec_auditor.wireless.wigle import (
     load_wardrive,
     parse_gpx,
@@ -224,6 +229,32 @@ def test_parse_wigle_csv_sanitizes_ssid() -> None:
     assert parse_wigle_csv(text)[0].ssid == "Evil[31mAP"
 
 
+def test_parse_wigle_csv_keeps_rows_with_unicode_line_separators() -> None:
+    # str.splitlines() would split this row at \x1c and silently drop the AP.
+    text = (
+        "WigleWifi-1.6\n"
+        "MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,"
+        "CurrentLongitude,AltitudeMeters,AccuracyMeters,Type\n"
+        "00:00:00:00:00:25,Rogue\x1cAP,[OPEN],t,6,-50,1,2,0,0,WIFI\n"
+    )
+    aps = parse_wigle_csv(text)
+    assert [ap.bssid for ap in aps] == ["00:00:00:00:00:25"]
+    assert aps[0].ssid == "RogueAP"
+
+
+def test_parse_wigle_csv_tolerates_non_finite_numbers() -> None:
+    text = (
+        "WigleWifi-1.6\n"
+        "MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,"
+        "CurrentLongitude,AltitudeMeters,AccuracyMeters,Type\n"
+        "00:00:00:00:00:26,Inf,[OPEN],t,inf,1e999,nan,inf,0,0,WIFI\n"
+    )
+    ap = parse_wigle_csv(text)[0]
+    assert ap.channel == 0
+    assert ap.latitude is None
+    assert ap.longitude is None
+
+
 def test_parse_wigle_csv_garbage_returns_empty() -> None:
     assert parse_wigle_csv("") == []
     assert parse_wigle_csv("just some text\nwith no header") == []
@@ -247,9 +278,9 @@ def test_parse_gpx_two_waypoints() -> None:
     assert wpa2.latitude == 59.9200
     assert wpa2.longitude == 10.7600
 
-    # Waypoint with no MAC falls back to the name as the key.
-    named = by_id["NAMEDONLY"]
-    assert named.bssid == "NamedOnly"
+    # A waypoint with no MAC keeps an empty BSSID; its name (the SSID) is never used.
+    named = by_id[""]
+    assert named.bssid == ""
     assert named.ssid == "NamedOnly"
     assert named.encryption == "open"
     assert any("Open network" in issue for issue in named.issues)
@@ -336,5 +367,136 @@ def test_load_wardrive_sniffs_unknown_extension(tmp_path) -> None:
     assert aps[0].source == "wigle"
 
 
-def test_load_wardrive_missing_file_returns_empty(tmp_path) -> None:
-    assert load_wardrive(tmp_path / "nope.csv") == []
+def test_load_wardrive_missing_file_raises(tmp_path) -> None:
+    with pytest.raises(wigle.WardriveFormatError, match="not found"):
+        load_wardrive(tmp_path / "nope.csv")
+
+
+WIGLE_HEADER = (
+    "WigleWifi-1.4,appRelease=x\n"
+    "MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,CurrentLongitude,"
+    "AltitudeMeters,AccuracyMeters,Type\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("name", "content", "reason"),
+    [
+        ("capture.dat", "just some notes\n", "unrecognised format"),
+        ("capture.csv", "a,b,c\n1,2,3\n", "no WiGLE CSV header"),
+        ("capture.gpx", "<gpx><wpt lat=", "malformed XML"),
+        ("capture.gpx", "", "malformed XML"),
+        ("capture.xml", "<html><body/></html>", "unexpected root element <html>"),
+        (
+            "capture.gpx",
+            '<!DOCTYPE gpx [<!ENTITY x SYSTEM "file:///etc/passwd">]><gpx>&x;</gpx>',
+            "malformed XML",
+        ),
+        (
+            "capture.netxml",
+            '<!DOCTYPE d [<!ENTITY a "aaaa"><!ENTITY b "&a;&a;">]>'
+            "<detection-run>&b;</detection-run>",
+            "malformed XML",
+        ),
+    ],
+)
+def test_load_wardrive_raises_for_files_it_cannot_parse(tmp_path, name, content, reason) -> None:
+    path = tmp_path / name
+    path.write_text(content)
+    with pytest.raises(wigle.WardriveFormatError, match=reason):
+        load_wardrive(path)
+
+
+def test_load_wardrive_raises_for_a_directory(tmp_path) -> None:
+    with pytest.raises(wigle.WardriveFormatError, match="not a regular file"):
+        load_wardrive(tmp_path)
+
+
+def test_load_wardrive_valid_files_without_access_points_return_empty(tmp_path) -> None:
+    csv_path = tmp_path / "ble-only.csv"
+    csv_path.write_text(WIGLE_HEADER + "99:99:99:99:99:99,Buds,Misc,t,0,-80,1,2,0,0,BLE\n")
+    gpx_path = tmp_path / "empty.gpx"
+    gpx_path.write_text('<?xml version="1.0"?>\n<gpx version="1.1"></gpx>\n')
+    assert load_wardrive(csv_path) == []
+    assert load_wardrive(gpx_path) == []
+
+
+def test_parse_wigle_csv_skips_rows_whose_mac_is_not_a_mac() -> None:
+    # The MAC column must never carry terminal escapes or arbitrary text.
+    text = (
+        WIGLE_HEADER
+        + "\x1b]0;PWNED\x1b\\AA:BB:CC:DD:EE:FF,Evil,[OPEN],t,6,-50,1,2,0,0,WIFI\n"
+        + "aa-bb-cc-dd-ee-01,Dashed,[OPEN],t,6,-50,1,2,0,0,WIFI\n"
+    )
+    assert [ap.bssid for ap in parse_wigle_csv(text)] == ["AA:BB:CC:DD:EE:01"]
+
+
+def test_parse_gpx_takes_the_bssid_only_from_a_mac_address() -> None:
+    text = (
+        "<gpx>"
+        '<wpt lat="1" lon="2"><name>Dashed</name><desc>BSSID=aa-bb-cc-dd-ee-02 WPA2</desc></wpt>'
+        '<wpt lat="1" lon="2"><name>Line\nBreak\u202eNet</name><cmt>open</cmt></wpt>'
+        "</gpx>"
+    )
+    aps = parse_gpx(text)
+    assert [(ap.bssid, ap.ssid) for ap in aps] == [
+        ("AA:BB:CC:DD:EE:02", "Dashed"),
+        ("", "LineBreakNet"),
+    ]
+
+
+def test_parse_kismet_netxml_validates_bssid_and_sanitizes_vendor() -> None:
+    text = (
+        "<detection-run>"
+        "<wireless-network><BSSID>AA:BB:CC:DD:EE:FF</BSSID>"
+        "<manuf>Ven\u202edor\u0085</manuf></wireless-network>"
+        "<wireless-network><BSSID>not-a-mac</BSSID></wireless-network>"
+        "</detection-run>"
+    )
+    aps = parse_kismet_netxml(text)
+    assert [(ap.bssid, ap.vendor) for ap in aps] == [("AA:BB:CC:DD:EE:FF", "Vendor")]
+
+
+def test_load_wardrive_gpx_survives_a_raw_control_byte_in_one_ssid(tmp_path) -> None:
+    # A gadget that copies an SSID byte-for-byte must not void the whole export.
+    path = tmp_path / "capture.gpx"
+    path.write_bytes(
+        b'<gpx><wpt lat="1" lon="2"><name>Good</name><desc>AA:BB:CC:DD:EE:01</desc></wpt>'
+        b'<wpt lat="1" lon="2"><name>Bad\x1bSSID</name><desc>AA:BB:CC:DD:EE:02</desc></wpt></gpx>'
+    )
+    aps = load_wardrive(path)
+    assert [(ap.bssid, ap.ssid) for ap in aps] == [
+        ("AA:BB:CC:DD:EE:01", "Good"),
+        ("AA:BB:CC:DD:EE:02", "BadSSID"),
+    ]
+
+
+def test_load_wardrive_honours_the_declared_xml_encoding(tmp_path) -> None:
+    path = tmp_path / "capture.netxml"
+    path.write_bytes(NETXML.replace("KismetNet", "Caf\u00e9Net").encode("latin-1"))
+    assert load_wardrive(path)[0].ssid == "Caf\u00e9Net"
+
+
+def _peak_bytes_while_loading(path) -> int:
+    tracemalloc.start()
+    try:
+        load_wardrive(path)
+        return tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+
+def test_load_wardrive_streams_csv_instead_of_reading_it_whole(tmp_path) -> None:
+    # 60k non-Wi-Fi rows (about 5 MiB) produce no access points, so peak memory
+    # reflects the parser alone.
+    path = tmp_path / "big.csv"
+    row = "99:99:99:99:99:99,Earbuds,Misc,2026-07-01 10:00:00,0,-80,59.9,10.7,0,5,BLE\n"
+    path.write_text(WIGLE_HEADER + row * 60_000)
+    assert _peak_bytes_while_loading(path) < 2 * 1024 * 1024
+
+
+def test_load_wardrive_streams_xml_instead_of_building_the_whole_tree(tmp_path) -> None:
+    path = tmp_path / "big.gpx"
+    track = "<trkpt lat='59.9' lon='10.7'><ele>1</ele></trkpt>" * 40_000
+    path.write_text(f"<gpx><trk><trkseg>{track}</trkseg></trk></gpx>")
+    assert _peak_bytes_while_loading(path) < 2 * 1024 * 1024

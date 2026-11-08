@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
-from typing import Any
+from typing import Any, cast
 
 import structlog
 
@@ -14,10 +15,13 @@ def configure_logging(level: str = "INFO", json_output: bool = False) -> None:
 
     timestamper = structlog.processors.TimeStamper(fmt="iso")
 
+    renderer: Any
     if json_output:
         renderer = structlog.processors.JSONRenderer()
     else:
-        renderer = structlog.dev.ConsoleRenderer(colors=True)
+        # Logs go to stderr; color them only on a terminal and honour NO_COLOR.
+        colors = sys.stderr.isatty() and not os.environ.get("NO_COLOR")
+        renderer = structlog.dev.ConsoleRenderer(colors=colors)
 
     processors: list[Any] = [
         structlog.stdlib.filter_by_level,
@@ -51,4 +55,4 @@ def configure_logging(level: str = "INFO", json_output: bool = False) -> None:
 
 def get_logger(name: str) -> structlog.stdlib.BoundLogger:
     """Get a structured logger instance."""
-    return structlog.get_logger(name)
+    return cast(structlog.stdlib.BoundLogger, structlog.get_logger(name))

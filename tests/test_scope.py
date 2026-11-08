@@ -109,12 +109,17 @@ def test_unresolvable_target_raises() -> None:
         scope.validate_target("this-host-does-not-exist.invalid")
 
 
+def _fake_dns(addresses: dict[str, str]):
+    def getaddrinfo(host, *_args, **_kwargs):
+        return [(2, 1, 6, "", (addresses.get(host, "10.0.0.7"), 0))]
+
+    return getaddrinfo
+
+
 def test_excluded_domain_covers_subdomains(monkeypatch: pytest.MonkeyPatch) -> None:
     # Excluding a name must also exclude everything beneath it, or an operator who
     # excluded prod would still scan db.prod.
-    monkeypatch.setattr(
-        "socket.getaddrinfo", lambda *_a, **_k: [(2, 1, 6, "", ("10.0.0.7", 0))]
-    )
+    monkeypatch.setattr("socket.getaddrinfo", _fake_dns({"prod.example.com": "10.0.0.99"}))
     scope = Scope(
         name="t",
         cidr_ranges=["10.0.0.0/24"],
@@ -125,6 +130,31 @@ def test_excluded_domain_covers_subdomains(monkeypatch: pytest.MonkeyPatch) -> N
     for excluded in ("prod.example.com", "db.prod.example.com", "a.b.prod.example.com"):
         with pytest.raises(ScopeError):
             scope.validate_target(excluded)
+
+
+def test_scalar_target_list_is_rejected_instead_of_voiding_an_exclusion(tmp_path) -> None:
+    # Iterated per character, "excluded_domains: prod.example.com" excluded nothing.
+    scope_file = tmp_path / "scope.yaml"
+    scope_file.write_text(
+        "name: t\n"
+        "domains: ['*.example.com']\n"
+        "excluded_domains: prod.example.com\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ScopeError, match="excluded_domains must be a list"):
+        Scope.from_yaml(scope_file)
+    with pytest.raises(ScopeError, match="ip_addresses must be a list"):
+        Scope(name="t", ip_addresses=[10])  # type: ignore[list-item]
+
+
+def test_empty_target_list_key_means_no_entries(tmp_path) -> None:
+    scope_file = tmp_path / "scope.yaml"
+    scope_file.write_text(
+        "name: t\ncidr_ranges: ['10.0.0.0/24']\nexcluded_domains:\n", encoding="utf-8"
+    )
+    scope = Scope.from_yaml(scope_file)
+    assert scope.excluded_domains == []
+    assert scope.validate_target("10.0.0.5") is True
 
 
 def test_wildcard_domain_matching() -> None:
@@ -145,3 +175,31 @@ def test_validate_port_semantics() -> None:
     assert restricted.validate_port(443) is True
     with pytest.raises(ScopeError):
         restricted.validate_port(8080)
+
+
+def test_excluded_domain_address_is_excluded_from_ip_and_range_targets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A host excluded by name stays excluded when reached by its address or a range.
+    monkeypatch.setattr("socket.getaddrinfo", _fake_dns({"prod.example.com": "10.0.0.99"}))
+    scope = Scope(
+        name="t",
+        cidr_ranges=["10.0.0.0/24"],
+        domains=["*.example.com"],
+        excluded_domains=["prod.example.com"],
+    )
+    with pytest.raises(ScopeError, match="excluded domain"):
+        scope.validate_target("10.0.0.99")
+    with pytest.raises(ScopeError, match="excluded address 10.0.0.99"):
+        scope.validate_target("10.0.0.0/24")
+    assert scope.validate_target("10.0.0.0/26") is True
+
+
+def test_host_port_targets_are_matched_on_the_host() -> None:
+    extract = Scope._extract_host
+    assert extract("10.0.0.5:8080") == "10.0.0.5"
+    assert extract("[fe80::1]:8443") == "fe80::1"
+    assert extract("fe80::1") == "fe80::1"
+    assert extract("device.local:abc") == "device.local:abc"
+    scope = Scope(name="t", ip_addresses=["10.0.0.5"])
+    assert scope.validate_target("10.0.0.5:8080") is True

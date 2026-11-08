@@ -22,13 +22,13 @@ pip install -e ".[dev]"
 
 ## Tests and linting
 
-The test suite and Ruff are required CI checks. Strict mypy also runs, but is
-currently advisory while the existing type backlog is resolved.
+The test suite, Ruff and strict mypy all run in CI on Python 3.11 to 3.15 and
+must pass.
 
 ```bash
 pytest                    # test suite
 ruff check .              # lint
-mypy netsec_auditor       # strict type check; currently reports known debt
+mypy netsec_auditor       # strict type check
 ```
 
 `ruff` and its rules are configured in `pyproject.toml`. Please add or update a
@@ -36,21 +36,31 @@ test for any behavior change, especially in the scanning, scope, or reporting
 paths.
 
 Write tests against the intended behavior, not against what the code currently
-does — several defects have survived because a test asserted them.
+does; a test that asserts a defect keeps it alive.
 
-CI also builds the Docker image, audits dependencies with `pip-audit`, and
-verifies `uv.lock` still resolves. The lockfile is for reproducible CI and local
-development only; the published wheel keeps the version ranges in
-`pyproject.toml`. Refresh it with `uv lock` when you change a dependency.
+CI also builds the Docker image, audits dependencies with `pip-audit`, and runs
+the tests against the exact versions in `uv.lock`, which the Docker image also
+installs. The published wheel keeps the version ranges in `pyproject.toml`.
+Refresh the lockfile with `uv lock` when you change a dependency.
 
 ## Pull requests
 
 - Keep the diff focused: one logical change per PR.
-- Make sure `pytest` and `ruff check .` pass before pushing.
+- Make sure `pytest`, `ruff check .` and `mypy netsec_auditor` pass before pushing.
 - Use clear commit subjects (e.g. `add DNP3 read-only probe`, not `update`).
   Reference issue numbers when relevant.
 - Note any new runtime dependency or required system package in the PR
   description.
+
+## Releases
+
+1. Set the new version in `netsec_auditor/__init__.py` (the only place it lives)
+   and the default `NETSEC_AUDITOR_REF` in `scripts/install.sh`, and update the
+   pinned example in the README.
+2. Merge to `main`, then push a `vX.Y.Z` tag. The `publish` workflow checks that the
+   tag matches both, runs the checks, builds the wheel and sdist with `SHA256SUMS`
+   and a build-provenance attestation, and creates the GitHub Release with
+   generated notes.
 
 ## Reporting security issues
 

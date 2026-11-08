@@ -1,15 +1,15 @@
 """Unit tests for OT/ICS read-only protocol probes.
 
-These exercise only the pure ``build_*`` / ``parse_*`` helpers against
-hand-crafted byte vectors derived from each protocol specification. No network
-I/O is performed here; the async ``probe_*`` functions are covered indirectly
-through their build/parse building blocks.
+These exercise the pure ``build_*`` / ``parse_*`` helpers against hand-crafted
+byte vectors derived from each protocol specification, and run the async
+``probe_*`` functions against in-memory peers. No network I/O is performed.
 """
 
 from __future__ import annotations
 
 import asyncio
 import struct
+import time
 
 import pytest
 
@@ -178,11 +178,13 @@ def _fake_s7_stream(
 def test_s7_exchange_sends_cotp_disconnect_before_closing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # CC: DST-REF 0x0001 (ours), SRC-REF 0x0002 (the PLC's).
     cc = b"\x03\x00\x00\x0b" + bytes((0x06, 0xD0, 0x00, 0x01, 0x00, 0x02, 0x00))
     sent, closed = _fake_s7_stream(monkeypatch, cc)
     cotp_ok, _ = asyncio.run(ot._s7_exchange("10.0.0.1", 102, 0.2))
     assert cotp_ok is True
-    assert sent[-1] == ot.build_cotp_disconnect()  # slot released, not a bare FIN
+    assert sent[-1] == ot.build_cotp_disconnect(dst_ref=0x0002)  # slot released, not a bare FIN
+    assert sent[-1][6:8] == cc[8:10]  # the DR names the PLC's reference, or it is discarded
     assert closed == [True]
 
 
@@ -247,57 +249,183 @@ def test_parse_enip_rejects_wrong_command() -> None:
 
 def test_build_bacnet_request() -> None:
     req = ot.build_bacnet_request()
-    assert req[0] == 0x81  # BVLC type BACnet/IP
-    assert req[1] == 0x0A  # Original-Unicast-NPDU
+    # Unicast confirmed ReadProperty(Device 4194303, Object_Identifier).
+    assert req == bytes.fromhex("81 0a 00 11 01 04 00 05 01 0c 0c 02 3f ff ff 19 4b")
     assert struct.unpack(">H", req[2:4])[0] == len(req)  # BVLC length field
-    assert req[-2:] == b"\x10\x08"  # Unconfirmed-Request Who-Is APDU
+    apdu = req[6:]
+    assert apdu[0] >> 4 == 0  # Confirmed-Request, so the answer is a unicast ACK
+    assert apdu[3] == 0x0C  # service choice 12 = ReadProperty
+    assert struct.unpack(">I", apdu[5:9])[0] == (8 << 22) | 4194303  # wildcard Device
+    assert apdu[-1] == 75  # property Object_Identifier
 
 
 def test_bacnet_request_is_not_routed_off_the_target() -> None:
-    # A broadcast Who-Is with a DNET is fanned out by a BBMD to its whole
-    # distribution table, far beyond the host actually being scanned.
+    # A broadcast or routed request is fanned out by a BBMD to its whole distribution
+    # table, and a Who-Is is often answered with a broadcast I-Am.
     req = ot.build_bacnet_request()
-    assert req[1] != 0x0B  # not Original-Broadcast-NPDU
-    assert req[5] & 0x20 == 0  # NPDU control: no DNET/DADR present
-    assert b"\xff\xff" not in req  # no global DNET
+    assert req[1] == 0x0A  # Original-Unicast-NPDU
+    assert req[4:6] == b"\x01\x04"  # NPDU: expecting reply, no DNET/SNET specifiers
+    assert req[6:8] != b"\x10\x08"  # not an Unconfirmed-Request Who-Is
 
 
-def _bacnet_iam_response(instance: int, vendor: int) -> bytes:
-    obj = (8 << 22) | instance  # object type 8 = device
-    apdu = bytes((0x10, 0x00))  # Unconfirmed-Request / I-Am
-    apdu += bytes((0xC4,)) + struct.pack(">I", obj)  # tag 12, length 4: object identifier
-    apdu += bytes((0x22, 0x01, 0xE0))  # tag 2 unsigned: max APDU accepted
-    apdu += bytes((0x91, 0x03))  # tag 9 enumerated: segmentation supported
-    apdu += bytes((0x21, vendor))  # tag 2 unsigned: vendor id
-    npdu = bytes((0x01, 0x00))  # version 1, control 0 (no dest/src specifiers)
+def _bacnet_reply(apdu: bytes, npdu: bytes = b"\x01\x00") -> bytes:
     body = npdu + apdu
     return struct.pack(">BBH", 0x81, 0x0A, len(body) + 4) + body
 
 
-def test_parse_bacnet_iam() -> None:
-    info = ot.parse_bacnet_response(_bacnet_iam_response(260, 99))
+def _read_property_ack(instance: int, invoke_id: int = 1) -> bytes:
+    echoed = struct.pack(">I", (8 << 22) | 4194303)  # devices may echo the wildcard
+    value = struct.pack(">I", (8 << 22) | instance)
+    # ComplexACK/ReadProperty: object id, property id, then the value in tags 3 open/close.
+    return (
+        bytes((0x30, invoke_id, 0x0C)) + b"\x0c" + echoed + b"\x19\x4b"
+        + b"\x3e\xc4" + value + b"\x3f"
+    )
+
+
+def test_parse_bacnet_read_property_ack() -> None:
+    info = ot.parse_bacnet_response(_bacnet_reply(_read_property_ack(260)))
     assert info == {
+        "response": "complex-ack",
         "object_id": "8:260",
         "device_instance": "260",
-        "vendor_id": "99",
     }
 
 
-def test_parse_bacnet_iam_with_source_specifier() -> None:
+def test_parse_bacnet_ack_with_source_specifier() -> None:
     # control 0x08 => source network present; APDU offset must account for it.
-    obj = (8 << 22) | 7
-    apdu = bytes((0x10, 0x00, 0xC4)) + struct.pack(">I", obj)
-    apdu += bytes((0x22, 0x01, 0xE0, 0x91, 0x03, 0x21, 0x2A))
     npdu = bytes((0x01, 0x08, 0x00, 0x01, 0x01, 0x0A))  # SNET 0x0001, SLEN 1, SADR 0x0A
-    body = npdu + apdu
-    packet = struct.pack(">BBH", 0x81, 0x0A, len(body) + 4) + body
-    info = ot.parse_bacnet_response(packet)
+    info = ot.parse_bacnet_response(_bacnet_reply(_read_property_ack(7), npdu))
     assert info["device_instance"] == "7"
-    assert info["vendor_id"] == "42"
+
+
+@pytest.mark.parametrize(
+    ("apdu", "expected"),
+    [
+        (bytes((0x50, 0x01, 0x0C, 0x91, 0x01, 0x91, 0x1F)),
+         {"response": "error", "error_class": "1", "error_code": "31"}),
+        (bytes((0x60, 0x01, 0x09)), {"response": "reject", "reject_reason": "9"}),
+        (bytes((0x71, 0x01, 0x04)), {"response": "abort", "abort_reason": "4"}),
+    ],
+    ids=["error", "reject", "abort"],
+)
+def test_parse_bacnet_error_reject_abort_prove_a_bacnet_stack(
+    apdu: bytes, expected: dict[str, str]
+) -> None:
+    assert ot.parse_bacnet_response(_bacnet_reply(apdu)) == expected
+
+
+def test_parse_bacnet_ignores_replies_to_other_requests() -> None:
+    obj = struct.pack(">I", (8 << 22) | 260)
+    unsolicited_iam = bytes((0x10, 0x00, 0xC4)) + obj + bytes((0x22, 0x01, 0xE0, 0x91, 0x03))
+    assert ot.parse_bacnet_response(_bacnet_reply(unsolicited_iam)) == {}
+    assert ot.parse_bacnet_response(_bacnet_reply(_read_property_ack(260, invoke_id=2))) == {}
 
 
 def test_parse_bacnet_rejects_non_bacnet() -> None:
     assert ot.parse_bacnet_response(b"\x00\x00\x00\x00\x00\x00") == {}
+
+
+def _vendor_ack(vendor: int, invoke_id: int = 2) -> bytes:
+    obj = struct.pack(">I", (8 << 22) | 260)
+    value = vendor.to_bytes(max(1, (vendor.bit_length() + 7) // 8), "big")
+    # ComplexACK/ReadProperty of Vendor_Identifier (120): an application-tagged Unsigned.
+    return (
+        bytes((0x30, invoke_id, 0x0C)) + b"\x0c" + obj + b"\x19\x78"
+        + b"\x3e" + bytes((0x20 | len(value),)) + value + b"\x3f"
+    )
+
+
+def test_build_bacnet_vendor_request() -> None:
+    req = ot.build_bacnet_request(260, 120, 2)
+    # Same unicast confirmed ReadProperty, now of Device 260's Vendor_Identifier.
+    assert req == bytes.fromhex("81 0a 00 11 01 04 00 05 02 0c 0c 02 00 01 04 19 78")
+
+
+def test_parse_bacnet_vendor_response() -> None:
+    assert ot.parse_bacnet_vendor_response(_bacnet_reply(_vendor_ack(42))) == "42"
+    assert ot.parse_bacnet_vendor_response(_bacnet_reply(_vendor_ack(260))) == "260"
+    # A reply to the first request, or an Error, carries no vendor identifier.
+    assert ot.parse_bacnet_vendor_response(_bacnet_reply(_vendor_ack(42, invoke_id=1))) is None
+    error = bytes((0x50, 0x02, 0x0C, 0x91, 0x02, 0x91, 0x20))
+    assert ot.parse_bacnet_vendor_response(_bacnet_reply(error)) is None
+    assert ot.parse_bacnet_vendor_response(b"\x00" * 8) is None
+
+
+def _bacnet_device(
+    monkeypatch: pytest.MonkeyPatch,
+    vendor_reply: bytes | None,
+    vendor_delay: float = 0.0,
+    first_reply: bytes | None = None,
+    vendor_raises: bool = False,
+) -> list[bytes]:
+    """Patch udp_request with a device answering each ReadProperty by its invoke id."""
+    sent: list[bytes] = []
+
+    async def fake_udp(host: str, port: int, payload: bytes, timeout: float) -> bytes | None:
+        sent.append(payload)
+        if payload[8] == 1:  # invoke id of the Object_Identifier read
+            return first_reply or _bacnet_reply(_read_property_ack(260))
+        await asyncio.sleep(vendor_delay)
+        if vendor_raises:
+            raise OSError("vendor read blew up")
+        return vendor_reply
+
+    monkeypatch.setattr(ot, "udp_request", fake_udp)
+    return sent
+
+
+def test_probe_bacnet_reads_the_vendor_once_the_instance_is_known(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sent = _bacnet_device(monkeypatch, _bacnet_reply(_vendor_ack(42)))
+    result = asyncio.run(ot.probe_bacnet("10.0.0.1", 47808, 0.5))
+    assert sent == [ot.build_bacnet_request(), ot.build_bacnet_request(260, 120, 2)]
+    assert result is not None
+    assert result.is_ot is True
+    assert result.banner == "8:260"
+    assert result.device_info == {
+        "response": "complex-ack",
+        "object_id": "8:260",
+        "device_instance": "260",
+        "vendor_id": "42",
+    }
+
+
+@pytest.mark.parametrize("vendor_raises", [False, True], ids=["no-reply", "raises"])
+def test_probe_bacnet_keeps_the_first_result_when_the_vendor_read_fails(
+    monkeypatch: pytest.MonkeyPatch, vendor_raises: bool
+) -> None:
+    sent = _bacnet_device(monkeypatch, None, vendor_raises=vendor_raises)
+    result = asyncio.run(ot.probe_bacnet("10.0.0.1", 47808, 0.5))
+    assert len(sent) == 2  # the vendor read was attempted
+    assert result is not None
+    assert result.device_info["device_instance"] == "260"
+    assert "vendor_id" not in result.device_info
+
+
+def test_probe_bacnet_vendor_read_stays_inside_the_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sent = _bacnet_device(monkeypatch, _bacnet_reply(_vendor_ack(42)), vendor_delay=5.0)
+    started = time.perf_counter()
+    result = asyncio.run(ot.probe_bacnet("10.0.0.1", 47808, 0.3))
+    assert time.perf_counter() - started < 0.3 + 0.2  # cut at the probe's own deadline
+    assert len(sent) == 2
+    assert result is not None
+    assert result.device_info["device_instance"] == "260"
+    assert "vendor_id" not in result.device_info
+
+
+def test_probe_bacnet_skips_the_vendor_read_without_an_instance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    error = _bacnet_reply(bytes((0x50, 0x01, 0x0C, 0x91, 0x01, 0x91, 0x1F)))
+    sent = _bacnet_device(monkeypatch, _bacnet_reply(_vendor_ack(42)), first_reply=error)
+    result = asyncio.run(ot.probe_bacnet("10.0.0.1", 47808, 0.5))
+    assert sent == [ot.build_bacnet_request()]
+    assert result is not None
+    assert result.device_info["response"] == "error"
 
 
 # DNP3
@@ -341,41 +469,85 @@ def test_parse_dnp3_rejects_bad_crc() -> None:
     assert ot.parse_dnp3_response(good)["dnp3"] == "detected"
 
 
-def test_probe_dnp3_tries_several_link_addresses(monkeypatch: pytest.MonkeyPatch) -> None:
+def _fake_dnp3_outstation(
+    monkeypatch: pytest.MonkeyPatch, address: int | None, hang_up: bool = False
+) -> list[list[bytes]]:
+    """Patch open_connection with an outstation answering only frames for ``address``.
+
+    Returns the frames written, one list per TCP connection opened.
+    """
+    connections: list[list[bytes]] = []
+
+    async def fake_open(host: str, port: int, **kwargs: object) -> tuple[object, object]:
+        frames: list[bytes] = []
+        connections.append(frames)
+        replies: asyncio.Queue[bytes] = asyncio.Queue()
+
+        class _Reader:
+            async def read(self, n: int) -> bytes:
+                if hang_up:
+                    return b""
+                return await replies.get()  # silent until a matching frame arrives
+
+            def at_eof(self) -> bool:
+                return hang_up
+
+        class _Writer:
+            def write(self, data: bytes) -> None:
+                frames.append(data)
+                if struct.unpack("<H", data[4:6])[0] == address:
+                    header = struct.pack("<BBBBHH", 0x05, 0x64, 0x05, 0x0B, 0, address)
+                    replies.put_nowait(header + struct.pack("<H", ot.dnp3_crc(header)))
+
+            async def drain(self) -> None:
+                return None
+
+            def close(self) -> None:
+                return None
+
+            async def wait_closed(self) -> None:
+                return None
+
+        return _Reader(), _Writer()
+
+    monkeypatch.setattr(asyncio, "open_connection", fake_open)
+    return connections
+
+
+def test_probe_dnp3_sweeps_link_addresses_on_one_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # An outstation at address 4 discards every other address, so a dst=0-only
     # probe would time out against it.
-    tried: list[int] = []
-
-    async def fake_tcp(
-        host: str, port: int, payload: bytes, timeout: float, **kwargs: object
-    ) -> bytes | None:
-        dst = struct.unpack("<H", payload[4:6])[0]
-        tried.append(dst)
-        if dst != 4:
-            return None
-        header = struct.pack("<BBBBHH", 0x05, 0x64, 0x05, 0x0B, 0, 4)
-        return header + struct.pack("<H", ot.dnp3_crc(header))
-
-    monkeypatch.setattr(ot, "tcp_request", fake_tcp)
+    connections = _fake_dnp3_outstation(monkeypatch, address=4)
     result = asyncio.run(ot.probe_dnp3("10.0.0.1", 20000, 0.6))
     assert result is not None
     assert result.is_ot is True
     assert result.device_info["source"] == "4"
-    assert tried == [0, 1, 3, 4]  # stops at the first answer
+    # One session: single-connection outstations would otherwise contend with the master.
+    assert len(connections) == 1
+    frames = connections[0]
+    assert [struct.unpack("<H", f[4:6])[0] for f in frames] == [0, 1, 3, 4]  # stops at 4
+    assert all(f[2] == 0x05 and f[3] == 0xC9 for f in frames)  # header-only link status
 
 
-def test_probe_dnp3_splits_the_timeout_budget(monkeypatch: pytest.MonkeyPatch) -> None:
-    budget: list[float] = []
+def test_probe_dnp3_silent_sweep_stays_inside_the_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connections = _fake_dnp3_outstation(monkeypatch, address=None)
+    started = time.perf_counter()
+    assert asyncio.run(ot.probe_dnp3("10.0.0.1", 20000, 0.3)) is None
+    assert time.perf_counter() - started < 0.3 + 0.25
+    assert len(connections) == 1
+    assert len(connections[0]) == len(ot._DNP3_LINK_ADDRESSES)
 
-    async def fake_tcp(
-        host: str, port: int, payload: bytes, timeout: float, **kwargs: object
-    ) -> bytes | None:
-        budget.append(timeout)
-        return None
 
-    monkeypatch.setattr(ot, "tcp_request", fake_tcp)
-    assert asyncio.run(ot.probe_dnp3("10.0.0.1", 20000, 6.0)) is None
-    assert sum(budget) == pytest.approx(6.0)  # the sweep stays inside the caller's budget
+def test_probe_dnp3_stops_when_the_outstation_hangs_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connections = _fake_dnp3_outstation(monkeypatch, address=None, hang_up=True)
+    assert asyncio.run(ot.probe_dnp3("10.0.0.1", 20000, 0.6)) is None
+    assert connections == [[ot.build_dnp3_request(dst=0)]]
 
 
 # OPC-UA

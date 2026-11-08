@@ -16,6 +16,7 @@ from typing import Any
 
 import httpx
 
+from netsec_auditor.utils.files import write_json_atomic
 from netsec_auditor.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -207,8 +208,7 @@ class KevCatalog:
     def _write_cache(self, payload: dict[str, Any]) -> None:
         try:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
-            with self.cache_file.open("w", encoding="utf-8") as fh:
-                json.dump(payload, fh)
+            write_json_atomic(self.cache_file, payload)
         except OSError as e:
             logger.debug("kev_cache_write_failed", error=str(e))
 

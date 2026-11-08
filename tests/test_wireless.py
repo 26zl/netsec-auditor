@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from typing import Any
+
+from netsec_auditor.wireless import base
 from netsec_auditor.wireless.base import (
     AccessPoint,
     BleDevice,
@@ -170,3 +173,91 @@ def test_identified_aps_still_deduplicate_by_bssid() -> None:
     rows = inv.aps()
     assert len(rows) == 1
     assert rows[0].signal_dbm == -55  # strongest sighting wins
+
+
+def _assessed(**fields: Any) -> AccessPoint:
+    ap = AccessPoint(**fields)
+    ap.issues = assess_access_point(ap)
+    return ap
+
+
+def _cloned_flags(ap: AccessPoint) -> list[str]:
+    return [i for i in ap.issues if i.startswith("Possible cloned-BSSID evil twin")]
+
+
+def test_inventory_keeps_a_cloned_bssid_apart_and_flags_both_sightings() -> None:
+    # An open evil twin that copies the real AP's BSSID on another channel must
+    # not be merged into (or hidden behind) the real WPA2 network.
+    inv = WirelessInventory()
+    inv.add_ap(_assessed(bssid="AA:BB:CC:00:00:01", ssid="CorpWiFi", channel=6,
+                         encryption="wpa2", auth="PSK"))
+    inv.add_ap(_assessed(bssid="aa:bb:cc:00:00:01", ssid="CorpWiFi", channel=11,
+                         encryption="open"))
+    rows = sorted(inv.aps(), key=lambda ap: ap.channel)
+    assert [(ap.channel, ap.encryption) for ap in rows] == [(6, "wpa2"), (11, "open")]
+    expected = (
+        "Possible cloned-BSSID evil twin: one BSSID advertised with conflicting "
+        "encryption (open, wpa2); channel (6, 11)"
+    )
+    assert all(_cloned_flags(ap) == [expected] for ap in rows)
+    assert any("Open network" in i for i in rows[1].issues)
+    assert all("AA:BB:CC" not in i.upper() for ap in rows for i in ap.issues)  # redaction-safe
+
+
+def test_inventory_merges_a_sparse_sighting_without_flagging() -> None:
+    # A hidden-SSID beacon (no SSID, no channel) is the same AP, not a clone.
+    inv = WirelessInventory()
+    inv.add_ap(_assessed(bssid="AA:BB:CC:00:00:02", ssid="Hidden", channel=6, encryption="wpa2"))
+    inv.add_ap(_assessed(bssid="AA:BB:CC:00:00:02", encryption="wpa2", signal_dbm=-40))
+    rows = inv.aps()
+    assert len(rows) == 1
+    assert rows[0].signal_dbm == -40
+    assert _cloned_flags(rows[0]) == []
+
+
+def test_inventory_bounds_sightings_and_clients_per_bssid() -> None:
+    inv = WirelessInventory()
+    for channel in range(1, 21):
+        inv.add_ap(AccessPoint(bssid="AA:BB:CC:00:00:03", channel=channel, encryption="wpa2"))
+    assert len(inv.aps()) == base.MAX_SIGHTINGS_PER_BSSID
+
+    many = [f"02:00:00:00:{n // 256:02X}:{n % 256:02X}" for n in range(300)]
+    inv.add_ap(AccessPoint(bssid="AA:BB:CC:00:00:04", encryption="wpa2", clients=[]))
+    inv.add_ap(AccessPoint(bssid="AA:BB:CC:00:00:04", encryption="wpa2", clients=many))
+    merged = next(ap for ap in inv.aps() if ap.bssid == "AA:BB:CC:00:00:04")
+    assert len(merged.clients) == base.MAX_CLIENTS_PER_AP
+
+
+def test_detect_evil_twins_flags_a_cloned_bssid() -> None:
+    aps = [
+        AccessPoint(bssid="00:00:00:00:00:01", ssid="Guest", channel=1, encryption="wpa2"),
+        AccessPoint(bssid="00:00:00:00:00:01", ssid="Guest", channel=1, encryption="open"),
+    ]
+    detect_evil_twins(aps)
+    for ap in aps:
+        assert len(_cloned_flags(ap)) == 1
+        assert "encryption (open, wpa2)" in _cloned_flags(ap)[0]
+
+
+def test_detect_evil_twins_flags_lookalike_ssids_separately_from_duplicates() -> None:
+    cyrillic_o = "C\u043erpWiFi"
+    fullwidth = "\uff23\uff4f\uff52\uff50WiFi"
+    aps = [
+        AccessPoint(bssid="00:00:00:00:00:01", ssid="CorpWiFi", encryption="wpa2"),
+        AccessPoint(bssid="00:00:00:00:00:02", ssid=cyrillic_o, encryption="wpa2"),
+        AccessPoint(bssid="00:00:00:00:00:03", ssid=fullwidth, encryption="wpa2"),
+        AccessPoint(bssid="00:00:00:00:00:04", ssid="Unrelated", encryption="wpa2"),
+    ]
+    detect_evil_twins(aps)
+    lookalike = [[i for i in ap.issues if i.startswith("Lookalike SSID")] for ap in aps]
+    assert [len(flags) for flags in lookalike] == [1, 1, 1, 0]
+    assert "'CorpWiFi'" in lookalike[1][0]
+    assert all(not i.startswith("Possible rogue/evil-twin") for ap in aps for i in ap.issues)
+
+
+def test_ssid_skeleton_folds_case_width_and_homoglyphs() -> None:
+    skeleton = base.ssid_skeleton
+    assert skeleton("CorpWiFi") == skeleton("c\u043erpwifi") == skeleton("\uff23orp\uff37iFi")
+    assert skeleton("\u0391\u0392\u0395") == skeleton("ABE")  # Greek capitals
+    assert skeleton("\u0441\u0430f\u0435") == skeleton("cafe")  # Cyrillic lower-case
+    assert skeleton("CorpWiFi") != skeleton("CorpWiFi2")

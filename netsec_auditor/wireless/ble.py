@@ -16,10 +16,17 @@ are pure and need neither bleak nor a radio, so they are fully unit-testable.
 
 from __future__ import annotations
 
+import asyncio
+from typing import Any
+
 from netsec_auditor.utils.logging import get_logger
 from netsec_auditor.wireless.base import BleDevice, assess_ble_device, sanitize_name
 
 logger = get_logger(__name__)
+
+# Extra seconds a scan may run past its duration before it is abandoned, so a
+# stuck BlueZ/D-Bus backend cannot hang the caller.
+_SCAN_GRACE_SECONDS = 10.0
 
 # A small subset of the Bluetooth SIG "Company Identifiers" (assigned numbers).
 # The 16-bit company id is the leading field of a manufacturer-specific
@@ -104,7 +111,8 @@ async def scan_ble(duration: float = 10.0, adapter: str | None = None) -> list[B
     returns the observed devices, each already assessed. Requires the optional
     :mod:`bleak` backend and a Bluetooth adapter; when bleak is not installed, or
     the scan fails, it logs a clear warning and returns ``[]`` rather than
-    raising, so callers can treat BLE as best-effort.
+    raising, so callers can treat BLE as best-effort. A scan still running
+    ``_SCAN_GRACE_SECONDS`` after ``duration`` is cancelled and abandoned.
 
     ``adapter`` selects a specific host adapter (e.g. ``"hci0"`` on BlueZ) and is
     forwarded to bleak only when set.
@@ -119,12 +127,22 @@ async def scan_ble(duration: float = 10.0, adapter: str | None = None) -> list[B
         )
         return []
 
-    kwargs: dict[str, object] = {"timeout": duration, "return_adv": True}
-    if adapter is not None:
-        kwargs["adapter"] = adapter
-
+    if adapter is None:
+        pending = BleakScanner.discover(timeout=duration, return_adv=True)
+    else:
+        pending = BleakScanner.discover(timeout=duration, return_adv=True, adapter=adapter)
+    scan = asyncio.ensure_future(pending)
+    scan.add_done_callback(_consume_outcome)
     try:
-        discovered = await BleakScanner.discover(**kwargs)
+        done, _ = await asyncio.wait({scan}, timeout=duration + _SCAN_GRACE_SECONDS)
+    finally:
+        if not scan.done():
+            scan.cancel()  # never awaited: a wedged backend must not hang the caller
+    if not done:
+        logger.warning("ble_scan_timeout", duration=duration, grace=_SCAN_GRACE_SECONDS)
+        return []
+    try:
+        discovered = scan.result()
     except Exception as exc:  # any backend/adapter error → degrade to empty result
         logger.warning("ble_scan_failed", error=str(exc))
         return []
@@ -144,3 +162,9 @@ async def scan_ble(duration: float = 10.0, adapter: str | None = None) -> list[B
 
     logger.info("ble_scan_complete", duration=duration, devices=len(devices))
     return devices
+
+
+def _consume_outcome(task: asyncio.Future[Any]) -> None:
+    """Retrieve an abandoned scan's exception so asyncio does not log it as unhandled."""
+    if not task.cancelled():
+        task.exception()
