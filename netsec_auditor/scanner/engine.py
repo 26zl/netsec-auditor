@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import math
 import os
 import time
 from dataclasses import dataclass, field
@@ -18,6 +19,9 @@ from netsec_auditor.scanner.scope import Scope, ScopeError
 from netsec_auditor.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+# nmap's minimum spacing between probes to one host for each -T template, in seconds.
+_TEMPLATE_SCAN_DELAY = {0: 300.0, 1: 15.0, 2: 0.4}
 
 
 def is_privileged() -> bool:
@@ -331,6 +335,7 @@ class PortScanner:
         ot_sensitive = bool(set(ports) & OT_PORTS)
         timing_template = min(self.timing_template, 2) if ot_sensitive else self.timing_template
         version_intensity = 0 if ot_sensitive else self.version_intensity
+        timeout = self._run_timeout(target, len(ports), timing_template)
         port_str = ",".join(str(p) for p in ports)
         scan_flag = {"syn": "-sS", "connect": "-sT", "udp": "-sU"}[scan_type]
         arguments = f"{scan_flag} -T{timing_template} --max-retries {self.max_retries}"
@@ -356,7 +361,7 @@ class PortScanner:
                     hosts=target,
                     ports=port_str,
                     arguments=arguments,
-                    timeout=self.timeout,
+                    timeout=timeout,
                 ),
             )
         except (nmap.PortScannerError, nmap.PortScannerTimeout, OSError) as e:
@@ -364,6 +369,24 @@ class PortScanner:
             return (None, time.monotonic() - start, "error")
 
         return (nm, time.monotonic() - start, "")
+
+    def _run_timeout(self, target: str, port_count: int, timing_template: int) -> int:
+        """Kill-switch budget for one nmap run, scaled to the work it contains.
+
+        ``timeout`` is an allowance per address, so a CIDR handed to nmap as one
+        range is not killed after a single host's worth of time; the probe spacing
+        of polite timing templates and the scope's ``--max-rate`` are added on top.
+        """
+        try:
+            addresses = ipaddress.ip_network(target, strict=False).num_addresses
+        except ValueError:
+            addresses = 1
+        probes = port_count * (self.max_retries + 1)
+        delay = _TEMPLATE_SCAN_DELAY.get(timing_template, 0.0)
+        seconds = addresses * (self.timeout + probes * delay)
+        if self.scope.max_scan_rate > 0:
+            seconds += addresses * probes / self.scope.max_scan_rate
+        return math.ceil(seconds)
 
     async def scan_network(
         self,
@@ -547,44 +570,6 @@ class PortScanner:
         )
 
 
-class BannerGrabber:
-    """TCP banner grabbing for service fingerprinting."""
-
-    def __init__(self, timeout: float = 5.0) -> None:
-        self.timeout = timeout
-
-    async def grab_banner(self, host: str, port: int) -> str:
-        """Connect to a port and grab the banner."""
-        try:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(host, port), timeout=self.timeout
-            )
-            try:
-                data = await asyncio.wait_for(reader.read(4096), timeout=self.timeout)
-                return data.decode("utf-8", errors="replace").strip()
-            finally:
-                writer.close()
-                await writer.wait_closed()
-        except (TimeoutError, ConnectionRefusedError, OSError) as e:
-            logger.debug("banner_grab_failed", host=host, port=port, error=str(e))
-            return ""
-
-    async def grab_banners(
-        self, host: str, ports: list[int], concurrency: int = 20
-    ) -> dict[int, str]:
-        """Grab banners from multiple ports concurrently."""
-        semaphore = asyncio.Semaphore(concurrency)
-
-        async def _grab_one(port: int) -> tuple[int, str]:
-            async with semaphore:
-                banner = await self.grab_banner(host, port)
-                return port, banner
-
-        tasks = [_grab_one(p) for p in ports]
-        results = await asyncio.gather(*tasks)
-        return dict(results)
-
-
 class NetworkDiscovery:
     """Network discovery — ping sweeps and ARP scans."""
 
@@ -622,6 +607,7 @@ class NetworkDiscovery:
 
         try:
             from scapy.all import ARP, Ether, srp
+            from scapy.error import Scapy_Exception
         except ImportError:
             logger.warning("scapy_not_installed")
             return []
@@ -632,9 +618,13 @@ class NetworkDiscovery:
         packet = broadcast / arp_request
 
         loop = asyncio.get_running_loop()
-        answered, _ = await loop.run_in_executor(
-            None, lambda: srp(packet, timeout=3, verbose=0)
-        )
+        try:
+            answered, _ = await loop.run_in_executor(
+                None, lambda: srp(packet, timeout=3, verbose=0)
+            )
+        except (OSError, Scapy_Exception) as exc:  # no raw-socket access (not root, chroot)
+            logger.warning("arp_scan_failed", cidr=cidr, error=str(exc))
+            return []
 
         results = []
         for _sent, received in answered:

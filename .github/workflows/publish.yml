@@ -9,46 +9,67 @@ permissions:
 
 jobs:
   build:
-    name: build + github release
+    name: test + build + github release
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: write # create the GitHub Release and attach the artifacts
+      id-token: write # sign the build provenance attestation
+      attestations: write
     outputs:
       prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          python-version: "3.12"
+          persist-credentials: false
 
-      - name: Verify tag matches package version
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+
+      - name: Verify the tag matches the package version and installer
         id: version
         run: |
           python - <<'PY'
           import os
           import re
-          import tomllib
           from pathlib import Path
 
-          version = tomllib.loads(Path("pyproject.toml").read_text())["project"]["version"]
+          init = Path("netsec_auditor/__init__.py").read_text(encoding="utf-8")
+          version = re.search(r'^__version__ = "([^"]+)"', init, re.MULTILINE).group(1)
           expected = f"v{version}"
           actual = os.environ["GITHUB_REF_NAME"]
           if actual != expected:
               raise SystemExit(f"tag {actual!r} does not match package version {expected!r}")
+          installer = Path("scripts/install.sh").read_text(encoding="utf-8")
+          if f"NETSEC_AUDITOR_REF:-{expected}}}" not in installer:
+              raise SystemExit(f"scripts/install.sh does not default to {expected}")
           # A PEP 440 pre-release (1.0.0rc1) is marked as such on the GitHub Release.
           prerelease = bool(re.search(r"(a|b|rc|dev)\d*$", version))
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
               fh.write(f"prerelease={str(prerelease).lower()}\n")
           PY
 
+      - name: Lint, type check and test
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+          ruff check .
+          mypy netsec_auditor
+          pytest
+
       - name: Build sdist + wheel
         run: |
-          python -m pip install --upgrade pip build
           python -m build
+          (cd dist && sha256sum -- * > SHA256SUMS)
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*
 
       - name: Upload dist artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist
           path: dist/

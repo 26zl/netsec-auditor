@@ -1,8 +1,8 @@
 """OT/ICS read-only protocol identification probes.
 
 Every prober is strictly read-only: it sends a single identification request
-(device identification, list-identity, who-is, link-status, hello) and parses
-the reply. No write, control, or configuration function codes are ever used.
+(device identification, list-identity, read-property, link-status, hello) and
+parses the reply. No write, control, or configuration function codes are ever used.
 
 Each protocol exposes three pieces: a pure ``build_<name>_request`` byte
 builder, a pure ``parse_<name>_response`` extractor (returns device-info fields,
@@ -56,7 +56,7 @@ def modbus_frame_length(data: bytes) -> int | None:
     """Total Modbus/TCP frame size: 6-byte MBAP prefix plus its length field."""
     if len(data) < 6:
         return None
-    return 6 + struct.unpack(">H", data[4:6])[0]
+    return 6 + int.from_bytes(data[4:6], "big")
 
 
 def build_modbus_request(unit_id: int = 0xFF, transaction_id: int = 1) -> bytes:
@@ -186,7 +186,7 @@ def tpkt_frame_length(data: bytes) -> int | None:
     """Total TPKT frame size, read from its 16-bit length field."""
     if len(data) < 4:
         return None
-    return struct.unpack(">H", data[2:4])[0]
+    return int.from_bytes(data[2:4], "big")
 
 
 def build_cotp_disconnect(dst_ref: int = 0x0000, src_ref: int = 0x0001) -> bytes:
@@ -293,6 +293,7 @@ async def _s7_exchange(
     # S7 needs a stateful COTP + setup handshake on one socket, so it cannot use the
     # single-shot tcp_request helper; the connection handling mirrors it otherwise.
     cotp_ok = False
+    peer_ref = 0
     try:
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(host, port), timeout
@@ -307,6 +308,8 @@ async def _s7_exchange(
         if len(cc) < 6 or cc[0] != 0x03 or (cc[5] & 0xF0) != 0xD0:  # CC TPDU type 0xD0
             return (False, None)
         cotp_ok = True
+        # The DR must name the PLC's SRC-REF from the CC, or a strict stack discards it.
+        peer_ref = int.from_bytes(cc[8:10], "big") if len(cc) >= 10 else 0
         writer.write(build_s7_setup_communication())
         await writer.drain()
         await read_framed(reader, timeout, tpkt_frame_length)
@@ -319,7 +322,7 @@ async def _s7_exchange(
     finally:
         if cotp_ok:  # release the PLC's connection slot; close() flushes it
             with contextlib.suppress(ConnectionError, OSError):
-                writer.write(build_cotp_disconnect())
+                writer.write(build_cotp_disconnect(dst_ref=peer_ref))
         writer.close()
         with contextlib.suppress(ConnectionError, OSError):
             await writer.wait_closed()
@@ -355,7 +358,7 @@ def enip_frame_length(data: bytes) -> int | None:
     """Total ENIP frame size: 24-byte encapsulation header plus its length field."""
     if len(data) < 4:
         return None
-    return 24 + struct.unpack("<H", data[2:4])[0]
+    return 24 + int.from_bytes(data[2:4], "little")
 
 
 def build_enip_request(sender_context: bytes = b"") -> bytes:
@@ -445,34 +448,111 @@ async def probe_enip_udp(host: str, port: int, timeout: float) -> ProbeResult | 
 
 # BACnet/IP (port 47808, UDP)
 
+_BACNET_INVOKE_ID = 0x01
+_BACNET_VENDOR_INVOKE_ID = 0x02  # distinct, so a late first reply is not taken as the vendor
+_BACNET_READ_PROPERTY = 0x0C  # confirmed service choice 12
+_BACNET_WILDCARD_INSTANCE = 0x3FFFFF  # Device instance 4194303 means "whoever receives this"
+_BACNET_PROP_OBJECT_IDENTIFIER = 75
+_BACNET_PROP_VENDOR_IDENTIFIER = 120
+_BACNET_COMPLEX_ACK = 0x3
+_BACNET_ERROR = 0x5
+_BACNET_REJECT = 0x6
+_BACNET_ABORT = 0x7
 
-def build_bacnet_request() -> bytes:
-    """Unconfirmed Who-Is addressed to one device, to elicit an I-Am reply.
 
-    Deliberately unicast with no DNET: a global-broadcast Who-Is (BVLC 0x0B, DNET
-    0xFFFF) reaching a BBMD is redistributed to its whole broadcast distribution
-    table, including slow MS/TP field segments well outside the scanned host.
+def build_bacnet_request(
+    instance: int = _BACNET_WILDCARD_INSTANCE,
+    prop: int = _BACNET_PROP_OBJECT_IDENTIFIER,
+    invoke_id: int = _BACNET_INVOKE_ID,
+) -> bytes:
+    """Confirmed ReadProperty of one Device property, by default the Object_Identifier.
+
+    Unicast with no DNET, and confirmed rather than a Who-Is: many stacks answer a
+    Who-Is with a broadcast I-Am that BBMDs redistribute site-wide, whereas a
+    ReadProperty is answered with a unicast ComplexACK to the requester.
     """
-    apdu = bytes((0x10, 0x08))  # Unconfirmed-Request PDU, service choice 0x08 = Who-Is
-    npdu = bytes((0x01, 0x00))  # version 1, control 0x00 = local, no routing
+    obj = (8 << 22) | (instance & 0x3FFFFF)  # object type 8 = Device
+    prop_bytes = prop.to_bytes(max(1, (prop.bit_length() + 7) // 8), "big")
+    # Confirmed-Request, max APDU 1476, invoke id, ReadProperty.
+    apdu = bytes((0x00, 0x05, invoke_id, _BACNET_READ_PROPERTY))
+    apdu += b"\x0c" + struct.pack(">I", obj)  # context tag 0: object id
+    apdu += bytes((0x18 | len(prop_bytes),)) + prop_bytes  # context tag 1: property id
+    npdu = bytes((0x01, 0x04))  # version 1, expecting reply, no routing
     body = npdu + apdu
     # BVLC: type 0x81 (BACnet/IP), function 0x0A (Original-Unicast-NPDU), total length
     return struct.pack(">BBH", 0x81, 0x0A, len(body) + 4) + body
 
 
 def parse_bacnet_response(data: bytes) -> dict[str, str]:
-    """Extract device instance and vendor id from a BACnet I-Am reply."""
+    """Read the device instance from the first ReadProperty's ComplexACK.
+
+    An Error, Reject or Abort for the same invoke id still proves a BACnet stack and
+    is reported as such; anything else, including an unsolicited I-Am, is ignored.
+    """
     try:
-        if len(data) < 6 or data[0] != 0x81:  # BVLC type = BACnet/IP
+        apdu = _bacnet_reply_apdu(data, _BACNET_INVOKE_ID)
+        if apdu is None:
             return {}
-        apdu = _bacnet_apdu(data)
-        if apdu is None or len(apdu) < 2:
-            return {}
-        if apdu[0] != 0x10 or apdu[1] != 0x00:  # Unconfirmed-Request / I-Am
-            return {}
-        return _parse_bacnet_iam(apdu[2:])
+        pdu_type = apdu[0] >> 4
+        if pdu_type == _BACNET_COMPLEX_ACK:
+            if not _is_read_property_ack(apdu):
+                return {}
+            info = {"response": "complex-ack"}
+            value = _read_property_value(apdu[3:])
+            if value is not None and value[0] == 12 and len(value[1]) == 4:  # object id
+                obj = int.from_bytes(value[1], "big")
+                info["object_id"] = f"{obj >> 22}:{obj & 0x3FFFFF}"
+                info["device_instance"] = str(obj & 0x3FFFFF)
+            return info
+        if pdu_type == _BACNET_ERROR:
+            info = {"response": "error"}
+            error_class, off = _read_bacnet_app_tag(apdu, 3)  # after the service choice
+            error_code, _ = _read_bacnet_app_tag(apdu, off)
+            if error_class:
+                info["error_class"] = str(int.from_bytes(error_class, "big"))
+            if error_code:
+                info["error_code"] = str(int.from_bytes(error_code, "big"))
+            return info
+        if pdu_type == _BACNET_REJECT:
+            return {"response": "reject", "reject_reason": str(apdu[2])}
+        if pdu_type == _BACNET_ABORT:
+            return {"response": "abort", "abort_reason": str(apdu[2])}
+        return {}
     except (struct.error, IndexError):
         return {}
+
+
+def parse_bacnet_vendor_response(data: bytes) -> str | None:
+    """Vendor identifier from the follow-up ReadProperty's ComplexACK, else None."""
+    try:
+        apdu = _bacnet_reply_apdu(data, _BACNET_VENDOR_INVOKE_ID)
+        if apdu is None or not _is_read_property_ack(apdu):
+            return None
+        value = _read_property_value(apdu[3:])
+        if value is None or value[0] != 2:  # application tag 2 = Unsigned
+            return None
+        return str(int.from_bytes(value[1], "big"))
+    except (struct.error, IndexError):
+        return None
+
+
+def _bacnet_reply_apdu(data: bytes, invoke_id: int) -> bytes | None:
+    # The APDU of a BACnet/IP reply, provided it answers ``invoke_id``.
+    if len(data) < 6 or data[0] != 0x81:  # BVLC type = BACnet/IP
+        return None
+    apdu = _bacnet_apdu(data)
+    if apdu is None or len(apdu) < 3 or apdu[1] != invoke_id:
+        return None
+    return apdu
+
+
+def _is_read_property_ack(apdu: bytes) -> bool:
+    # Unsegmented ComplexACK whose service ACK choice is ReadProperty.
+    return (
+        apdu[0] >> 4 == _BACNET_COMPLEX_ACK
+        and not apdu[0] & 0x08
+        and apdu[2] == _BACNET_READ_PROPERTY
+    )
 
 
 def _bacnet_apdu(data: bytes) -> bytes | None:
@@ -493,22 +573,17 @@ def _bacnet_apdu(data: bytes) -> bytes | None:
     return data[off:]
 
 
-def _parse_bacnet_iam(apdu: bytes) -> dict[str, str]:
-    info: dict[str, str] = {}
+def _read_property_value(body: bytes) -> tuple[int, bytes] | None:
+    # Skip the echoed object id, property id and any array index up to opening tag 3,
+    # then return the application tag number and bytes of the value it wraps.
     off = 0
-    params: list[bytes] = []
-    while off < len(apdu) and len(params) < 4:
-        value, off = _read_bacnet_app_tag(apdu, off)
-        if value is None:
-            break
-        params.append(value)
-    if params:
-        obj = int.from_bytes(params[0], "big")
-        info["object_id"] = f"{obj >> 22}:{obj & 0x3FFFFF}"
-        info["device_instance"] = str(obj & 0x3FFFFF)
-    if len(params) >= 4:
-        info["vendor_id"] = str(int.from_bytes(params[3], "big"))
-    return info
+    while off < len(body) and body[off] != 0x3E:
+        _, off = _read_bacnet_app_tag(body, off)
+    off += 1
+    if off >= len(body) or body[off] & 0x08:  # a context tag, not an application value
+        return None
+    value, _ = _read_bacnet_app_tag(body, off)
+    return (body[off] >> 4, value) if value else None
 
 
 def _read_bacnet_app_tag(data: bytes, off: int) -> tuple[bytes | None, int]:
@@ -523,8 +598,25 @@ def _read_bacnet_app_tag(data: bytes, off: int) -> tuple[bytes | None, int]:
     return (data[off:off + length], off + length)
 
 
+async def _read_bacnet_vendor_id(
+    host: str, port: int, instance: int, timeout: float
+) -> str | None:
+    request = build_bacnet_request(
+        instance, _BACNET_PROP_VENDOR_IDENTIFIER, _BACNET_VENDOR_INVOKE_ID
+    )
+    reply = await udp_request(host, port, request, timeout)
+    return parse_bacnet_vendor_response(reply) if reply else None
+
+
 async def probe_bacnet(host: str, port: int, timeout: float) -> ProbeResult | None:
-    """Identify a BACnet/IP device via Who-Is / I-Am."""
+    """Identify a BACnet/IP device via unicast ReadProperty requests.
+
+    The first reads the Object_Identifier; once the instance is known a second reads
+    its Vendor_Identifier in what is left of ``timeout``, and if that read fails the
+    first result is kept.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
     try:
         data = await udp_request(host, port, build_bacnet_request(), timeout)
         if not data:
@@ -534,6 +626,14 @@ async def probe_bacnet(host: str, port: int, timeout: float) -> ProbeResult | No
         return None
     if not info:
         return None
+    instance = info.get("device_instance")
+    remaining = deadline - loop.time()
+    if instance is not None and remaining > 0:
+        with contextlib.suppress(Exception):
+            async with asyncio.timeout(remaining):
+                vendor_id = await _read_bacnet_vendor_id(host, port, int(instance), remaining)
+            if vendor_id is not None:
+                info["vendor_id"] = vendor_id
     return ProbeResult(
         protocol="bacnet",
         port=port,
@@ -600,25 +700,43 @@ def parse_dnp3_response(data: bytes) -> dict[str, str]:
         return {}
 
 
-async def probe_dnp3(host: str, port: int, timeout: float) -> ProbeResult | None:
-    """Detect a DNP3 outstation via a Request Link Status frame.
-
-    Each candidate link address gets an equal slice of ``timeout`` so the whole
-    sweep stays inside the caller's budget rather than multiplying it.
-    """
+async def _dnp3_exchange(host: str, port: int, timeout: float) -> dict[str, str]:
+    # One session for the whole sweep: outstations often accept a single master
+    # connection, so reconnecting per address could contend with the SCADA master.
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout
+        )
+    except (TimeoutError, ConnectionError, OSError):
+        return {}
     per_try = timeout / len(_DNP3_LINK_ADDRESSES)
-    info: dict[str, str] = {}
     try:
         for dst in _DNP3_LINK_ADDRESSES:
-            data = await tcp_request(
-                host, port, build_dnp3_request(dst=dst), per_try,
-                frame_length=dnp3_frame_length,
-            )
-            if not data:
-                continue
-            info = parse_dnp3_response(data)
+            writer.write(build_dnp3_request(dst=dst))
+            await writer.drain()
+            reply = await read_framed(reader, per_try, dnp3_frame_length)
+            info = parse_dnp3_response(reply) if reply else {}
             if info:
+                return info
+            if reader.at_eof():  # the outstation hung up, so later frames go nowhere
                 break
+        return {}
+    except (TimeoutError, ConnectionError, OSError):
+        return {}
+    finally:
+        writer.close()
+        with contextlib.suppress(ConnectionError, OSError):
+            await writer.wait_closed()
+
+
+async def probe_dnp3(host: str, port: int, timeout: float) -> ProbeResult | None:
+    """Detect a DNP3 outstation via Request Link Status frames on one connection.
+
+    Each candidate link address gets an equal slice of ``timeout`` to answer, and
+    the sweep stops at the first valid reply.
+    """
+    try:
+        info = await _dnp3_exchange(host, port, timeout)
     except Exception:
         return None
     if not info:
@@ -642,7 +760,7 @@ def opcua_frame_length(data: bytes) -> int | None:
     """Total OPC-UA message size, read from the 4-byte MessageSize field."""
     if len(data) < 8:
         return None
-    return struct.unpack("<I", data[4:8])[0]
+    return int.from_bytes(data[4:8], "little")
 
 
 def build_opcua_request(endpoint_url: str) -> bytes:

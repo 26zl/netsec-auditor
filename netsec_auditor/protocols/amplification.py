@@ -5,8 +5,9 @@ abused for reflection/amplification DDoS and checks whether the service answers.
 A reply means the host could be leveraged as a reflector — the finding is the
 *exposure*, not any traffic we generate: we send one datagram (NTP falls back to
 one extra liveness datagram if monlist is filtered) and read at most one reply.
-Nothing here floods, writes, or changes device state, so it is passive- and
-OT-safe.
+Nothing here writes or changes device state, but a monlist, memcached ``stats``
+or ``ssdp:all`` reply spans several datagrams however few we read, so those specs
+are ``is_safe=False`` and only profiles that allow intrusive probes run them.
 
 Pure ``build_*`` request builders are unit-testable without a network; each
 ``probe_*`` coroutine returns a :class:`ProbeResult` when the service answers and
@@ -211,8 +212,9 @@ async def probe_chargen(host: str, port: int, timeout: float) -> ProbeResult | N
 def build_ssdp_amp_request(host: str, port: int = 1900) -> bytes:
     """Build an M-SEARCH ``ssdp:all`` request addressed to ``host`` as a reflector trigger.
 
-    Same request as :func:`netsec_auditor.protocols.iot.build_ssdp_request`, but the
-    target must be passed through: a unicast datagram carrying the multicast
+    Built with :func:`netsec_auditor.protocols.iot.build_ssdp_request` but searching
+    ``ssdp:all``, whose multi-datagram reply is what makes a reflector; the target is
+    passed through because a unicast datagram carrying the multicast
     ``HOST: 239.255.255.250:1900`` deviates from UPnP DA 1.1 and strict devices drop
     it, which would under-report the reflector finding. The distinction from the iot
     discovery probe is the finding — here a reply means an exploitable reflector.
@@ -249,6 +251,7 @@ SPECS: list[ProbeSpec] = [
         transport="udp",
         is_ot=False,
         probe=probe_ntp,
+        is_safe=False,  # a monlist reply runs to ~100 datagrams
     ),
     ProbeSpec(
         name="memcached",
@@ -256,6 +259,7 @@ SPECS: list[ProbeSpec] = [
         transport="udp",
         is_ot=False,
         probe=probe_memcached,
+        is_safe=False,  # stats output is split across several datagrams
     ),
     ProbeSpec(
         name="chargen",
@@ -270,5 +274,6 @@ SPECS: list[ProbeSpec] = [
         transport="udp",
         is_ot=False,
         probe=probe_ssdp_amp,
+        is_safe=False,  # ssdp:all draws one datagram per advertised service
     ),
 ]

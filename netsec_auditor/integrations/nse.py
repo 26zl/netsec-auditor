@@ -25,6 +25,8 @@ import contextlib
 import re
 import shutil
 import xml.etree.ElementTree as ET
+from collections.abc import Collection, Iterable
+from typing import Any, cast
 
 from defusedxml.ElementTree import DefusedXMLParser
 
@@ -42,12 +44,17 @@ SMB_SCRIPTS = [
     "smb-vuln-ms17-010",  # officially categorized safe DETECTION (no exploitation)
 ]
 SNMP_SCRIPTS = ["snmp-info", "snmp-sysdescr"]
+# iec-identify, iec61850-mms and hartip-info stay out: nmap classes them intrusive
+# (iec-identify activates data transfer on the RTU).
 ICS_SCRIPTS = [
     "modbus-discover",
     "s7-info",
     "bacnet-info",
     "enip-info",
     "omron-info",
+    "fox-info",
+    "knx-gateway-info",
+    "pcworx-info",
 ]
 DISCOVERY_SCRIPTS = ["banner", "http-title"]
 
@@ -58,6 +65,19 @@ SCRIPT_SETS: dict[str, list[str]] = {
     "snmp": SNMP_SCRIPTS,
     "ics": ICS_SCRIPTS,
     "discovery": DISCOVERY_SCRIPTS,
+}
+
+# Ports each set needs: the TCP ports kept from a host's open ports (None keeps all of
+# them) and the UDP ports, which nmap can only scan with root.
+SET_PORTS: dict[str, tuple[frozenset[int] | None, frozenset[int]]] = {
+    "tls": (None, frozenset()),
+    "smb": (frozenset({139, 445}), frozenset()),
+    "snmp": (frozenset(), frozenset({161})),
+    "ics": (
+        frozenset({102, 502, 1911, 1962, 4911, 9600, 44818}),
+        frozenset({3671, 47808}),
+    ),
+    "discovery": (None, frozenset()),
 }
 
 # Data-driven heuristics: (script_id, keyword, severity, name). Matching is a
@@ -85,12 +105,34 @@ _DEFAULT_REMEDIATION = "Review the NSE output and remediate per vendor guidance.
 # read-only guarantee the curated script sets provide.
 _PACING_ARG_RE = re.compile(
     r"-T[0-5]|--host-timeout=\S+|--max-retries=\d+|--scan-delay=\S+|--min-rate=\d+"
+    r"|--max-rate=\d+|--max-parallelism=\d+"
 )
 
 
 def nse_available() -> bool:
     """Return True if the ``nmap`` binary is on ``PATH``."""
     return shutil.which("nmap") is not None
+
+
+def port_spec(
+    set_name: str,
+    open_tcp: Iterable[int],
+    *,
+    udp: bool,
+    allowed: Collection[int] | None = None,
+) -> str:
+    """Return the ``-p`` value for one set on one host ('' when nothing applies).
+
+    TCP ports come from what the scan found open, so NSE never runs its own port
+    discovery; UDP ports are added only when a UDP scan is possible.
+    """
+    tcp_filter, udp_ports = SET_PORTS.get(set_name, (None, frozenset()))
+    tcp = sorted(p for p in set(open_tcp) if tcp_filter is None or p in tcp_filter)
+    udp_list = sorted(udp_ports) if udp else []
+    if allowed is not None:
+        tcp = [p for p in tcp if p in allowed]
+        udp_list = [p for p in udp_list if p in allowed]
+    return ",".join([f"T:{p}" for p in tcp] + [f"U:{p}" for p in udp_list])
 
 
 def build_nmap_command(
@@ -102,6 +144,9 @@ def build_nmap_command(
     """Build the argv for ``nmap -Pn --script ... [-p ...] -oX - <target>``."""
     cmd = ["nmap", "-Pn", "--script", ",".join(scripts)]
     if ports:
+        if "U:" in ports:
+            # UDP ports need -sU (root); TCP ports alongside them then need -sS too.
+            cmd += ["-sU", "-sS"] if "T:" in ports else ["-sU"]
         cmd += ["-p", ports]
     for arg in extra_args or []:
         if _PACING_ARG_RE.fullmatch(arg):
@@ -146,7 +191,7 @@ async def run_nse(
     ports: str | None = None,
     timeout: float = 120.0,
     extra_args: list[str] | None = None,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """Run curated NSE scripts against ``target`` and return parsed findings.
 
     Returns ``[]`` when nmap is absent, no scripts are requested, or on any
@@ -173,7 +218,7 @@ async def run_script_set(
     ports: str | None = None,
     timeout: float = 120.0,
     extra_args: list[str] | None = None,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """Run a named curated set from :data:`SCRIPT_SETS` (``[]`` if unknown)."""
     scripts = SCRIPT_SETS.get(set_name)
     if not scripts:
@@ -191,7 +236,9 @@ def _host_address(host: ET.Element) -> str:
     return addresses[0].get("addr", "") if addresses else ""
 
 
-def _script_finding(host: str, port: int | None, protocol: str, script: ET.Element) -> dict:
+def _script_finding(
+    host: str, port: int | None, protocol: str, script: ET.Element
+) -> dict[str, Any]:
     """Build one raw finding record from a ``<script>`` element."""
     return {
         "host": host,
@@ -202,10 +249,10 @@ def _script_finding(host: str, port: int | None, protocol: str, script: ET.Eleme
     }
 
 
-def _parse_host(host: ET.Element) -> list[dict]:
+def _parse_host(host: ET.Element) -> list[dict[str, Any]]:
     """Extract host-level and port-level script outputs from a ``<host>``."""
     ip = _host_address(host)
-    findings: list[dict] = []
+    findings: list[dict[str, Any]] = []
     # Host-level scripts: <hostscript><script id=.. output=..>
     for script in host.findall("./hostscript/script"):
         findings.append(_script_finding(ip, None, "", script))
@@ -219,14 +266,14 @@ def _parse_host(host: ET.Element) -> list[dict]:
     return findings
 
 
-def parse_nmap_xml(xml_text: str) -> list[dict]:
+def parse_nmap_xml(xml_text: str) -> list[dict[str, Any]]:
     """Parse nmap ``-oX`` XML into one finding dict per script output.
 
     Each finding is ``{"host", "port", "protocol", "script_id", "output"}``.
     Handles both host-level ``<hostscript>`` and port-level ``<port>`` scripts,
     and tolerates truncated/malformed XML by returning whatever fully parsed.
     """
-    findings: list[dict] = []
+    findings: list[dict[str, Any]] = []
     if not xml_text or not xml_text.strip():
         return findings
     # A pull parser lets us keep complete <host> subtrees even if the tail is
@@ -240,13 +287,15 @@ def parse_nmap_xml(xml_text: str) -> list[dict]:
     with contextlib.suppress(ET.ParseError):
         parser.feed(xml_text)
     with contextlib.suppress(ET.ParseError):
-        for _event, elem in parser.read_events():
-            if elem.tag == "host":
-                findings.extend(_parse_host(elem))
+        for event in parser.read_events():
+            # defusedxml builds pure-Python elements, so match on the tag, not the C class.
+            elem = event[-1]
+            if getattr(elem, "tag", None) == "host":
+                findings.extend(_parse_host(cast(ET.Element, elem)))
     return findings
 
 
-def _normalize(finding: dict, severity: str, name: str) -> dict:
+def _normalize(finding: dict[str, Any], severity: str, name: str) -> dict[str, Any]:
     """Turn a raw finding into a normalized, five-key finding with context."""
     script_id = finding.get("script_id", "")
     return {
@@ -262,9 +311,9 @@ def _normalize(finding: dict, severity: str, name: str) -> dict:
     }
 
 
-def summarize_findings(findings: list[dict]) -> list[dict]:
+def summarize_findings(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Apply :data:`SUMMARY_RULES` to raw findings, yielding normalized findings."""
-    summary: list[dict] = []
+    summary: list[dict[str, Any]] = []
     for finding in findings:
         script_id = finding.get("script_id", "")
         output_upper = str(finding.get("output", "")).upper()

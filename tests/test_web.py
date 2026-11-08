@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import socket
+import time
 
 import httpx
 import pytest
@@ -212,3 +213,55 @@ def test_scan_marks_unreachable_host(monkeypatch) -> None:
 
     assert result.reachable is False
     assert result.server == ""
+
+
+def test_dev_comment_check_is_linear_on_hostile_bodies() -> None:
+    # Unclosed comments full of markers make a backtracking regex cubic (8 KB took ~13 s).
+    scanner = WebScanner(Scope(name="t", ip_addresses=["127.0.0.1"]))
+    hostile = HTTPResponse(status_code=200, headers={}, body="<!--TODO" * 1_000)
+    started = time.perf_counter()
+    assert scanner._check_information_disclosure(hostile, "http://127.0.0.1/") == []
+    assert time.perf_counter() - started < 2.0
+
+    page = HTTPResponse(
+        status_code=200, headers={}, body="<p>x</p><!-- FIXME:\n remove --><!-- plain -->"
+    )
+    names = [v.name for v in scanner._check_information_disclosure(page, "http://h/")]
+    asyncio.run(scanner.close())
+    assert names == ["Developer comments in HTML source"]
+
+
+@pytest.mark.parametrize("charset", ["rot13", "hex", "base64", "idna", "undefined"])
+def test_body_decoding_survives_non_text_charsets(charset: str) -> None:
+    # A device can declare any codec name; a binary codec must not abort the scan.
+    assert WebScanner._decode_body(b"<html>ok</html>", charset) == "<html>ok</html>"
+
+
+def test_certificate_with_unsupported_signature_algorithm_is_still_reported() -> None:
+    import datetime
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "device.test")])
+    now = datetime.datetime.now(datetime.UTC)
+    cert = (
+        x509.CertificateBuilder().subject_name(name).issuer_name(name)
+        .public_key(key.public_key()).serial_number(1)
+        .not_valid_before(now).not_valid_after(now + datetime.timedelta(days=30))
+        .sign(key, hashes.SHA256())
+    )
+    der = cert.public_bytes(serialization.Encoding.DER)
+    # Swap ecdsa-with-SHA256 for an OID the backend does not know (as on legacy devices).
+    known = bytes.fromhex("06082A8648CE3D040302")
+    unknown = bytes.fromhex("06082A8648CE3D04037F")
+    assert der.count(known) == 2
+
+    scanner = WebScanner.__new__(WebScanner)
+    parsed = scanner._parse_certificate(der.replace(known, unknown), "device.test")
+
+    assert parsed.is_self_signed is True
+    assert parsed.signature_algorithm == "1.2.840.10045.4.3.127"

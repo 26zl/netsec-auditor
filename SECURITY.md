@@ -36,7 +36,8 @@ Security-relevant reports we *do* want:
   leaking into logs or generated reports.
 - **Local safety** — path traversal, symlink following, or unsafe permissions
   when writing reports, caches, or scope files (especially under sudo).
-- **Supply-chain** issues in the packaged distribution (PyPI wheel, Docker image).
+- **Supply-chain** issues in what we ship: the release wheel and sdist, the
+  Dockerfile, and `scripts/install.sh`.
 
 ## Responsible use
 

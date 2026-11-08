@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import ssl
 
 import pytest
 
 from netsec_auditor import profiles
 from netsec_auditor.protocols.base import (
+    MAX_FRAME_BYTES,
     ProbeResult,
     ProbeSpec,
     probers_for_port,
     read_framed,
     register,
+    tcp_request,
 )
 from netsec_auditor.protocols.scan import identify_services
 
@@ -101,7 +104,7 @@ def test_identify_services_restricts_transport_when_udp_ports_given() -> None:
 
 
 def test_identify_services_validates_arguments_with_no_matching_prober() -> None:
-    # The guards used to sit behind the "no specs" early return.
+    # Arguments are validated even when no prober matches the port.
     with pytest.raises(ValueError, match="timeout"):
         asyncio.run(identify_services("10.0.0.1", [65535], profiles.IT, timeout=0))
     with pytest.raises(ValueError, match="rate_per_second"):
@@ -135,3 +138,70 @@ def test_read_framed_returns_what_arrived_when_the_frame_never_completes() -> No
     got = asyncio.run(read_framed(_Reader(), 0.1, lambda d: 4 + int.from_bytes(d[1:4], "big")))
     assert got.startswith(b"\x00\x00\x00\xff")
     assert len(got) < 259  # timed out, but the partial reply is still handed back
+
+
+def test_read_framed_caps_an_oversized_declared_frame() -> None:
+    # A peer declaring a 4 GiB OPC-UA message and then streaming without end.
+    header = [b"ACKF\xff\xff\xff\xff"]
+    seen: list[int] = []
+
+    class _Reader:
+        async def read(self, n: int) -> bytes:
+            await asyncio.sleep(0)
+            return header.pop() if header else bytes(n)
+
+    def frame_length(data: bytes) -> int | None:
+        seen.append(len(data))
+        return int.from_bytes(data[4:8], "little") if len(data) >= 8 else None
+
+    got = asyncio.run(read_framed(_Reader(), 0.5, frame_length))
+    assert len(got) == MAX_FRAME_BYTES
+    assert seen == [8]  # the declared size is read once, not re-derived per chunk
+
+
+def test_read_framed_waits_for_a_split_header() -> None:
+    chunks = [b"\x00\x00", b"\x00\x02ab"]
+
+    class _Reader:
+        async def read(self, n: int) -> bytes:
+            return chunks.pop(0) if chunks else b""
+
+    def frame_length(data: bytes) -> int | None:
+        return 4 + int.from_bytes(data[1:4], "big") if len(data) >= 4 else None
+
+    assert asyncio.run(read_framed(_Reader(), 1.0, frame_length)) == b"\x00\x00\x00\x02ab"
+
+
+def test_tcp_request_uses_tls_only_when_given_a_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opened: list[dict[str, object]] = []
+
+    class _Reader:
+        async def read(self, n: int) -> bytes:
+            return b"pong"
+
+    class _Writer:
+        def write(self, data: bytes) -> None:
+            return None
+
+        async def drain(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+        async def wait_closed(self) -> None:
+            return None
+
+    async def fake_open(host: str, port: int, **kwargs: object) -> tuple[_Reader, _Writer]:
+        opened.append(kwargs)
+        return _Reader(), _Writer()
+
+    monkeypatch.setattr(asyncio, "open_connection", fake_open)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    assert asyncio.run(tcp_request("10.0.0.1", 8883, b"ping", 0.5, ssl_context=context)) == b"pong"
+    assert asyncio.run(tcp_request("10.0.0.1", 1883, b"ping", 0.5)) == b"pong"
+    assert opened[0]["ssl"] is context
+    assert opened[0]["ssl_shutdown_timeout"] == 0.5  # a silent peer cannot stall the close
+    assert opened[1] == {}

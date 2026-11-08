@@ -8,12 +8,14 @@ test performs any real network I/O.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import struct
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 
 import pytest
 
-from netsec_auditor.protocols import amplification
+from netsec_auditor import profiles
+from netsec_auditor.protocols import amplification, iot
 from netsec_auditor.protocols.amplification import (
     SPECS,
     build_chargen_request,
@@ -22,6 +24,7 @@ from netsec_auditor.protocols.amplification import (
     build_ntp_version_request,
     build_ssdp_amp_request,
 )
+from netsec_auditor.protocols.scan import identify_services
 
 # NTP monlist
 
@@ -110,8 +113,36 @@ def test_specs_cover_expected_udp_reflectors() -> None:
     for spec in SPECS:
         assert spec.transport == "udp"
         assert spec.is_ot is False  # amplification probes are never flagged OT
-        assert spec.is_safe is True  # read-only, single query
         assert callable(spec.probe)
+    # Only chargen answers with a single datagram; the rest are gated like SNMP.
+    assert {s.name: s.is_safe for s in SPECS} == {
+        "ntp-monlist": False,
+        "memcached": False,
+        "chargen": True,
+        "ssdp-amp": False,
+    }
+
+
+def test_ot_profile_skips_multi_datagram_reflectors(monkeypatch: pytest.MonkeyPatch) -> None:
+    sent: list[tuple[str, int]] = []
+
+    def _recorder(module: str) -> Callable[..., Awaitable[bytes | None]]:
+        async def fake_udp(host: str, port: int, payload: bytes, timeout: float) -> None:
+            sent.append((module, port))
+            return None
+        return fake_udp
+
+    monkeypatch.setattr(amplification, "udp_request", _recorder("amplification"))
+    monkeypatch.setattr(iot, "udp_request", _recorder("iot"))
+    udp_ports = [123, 11211, 19, 1900]
+
+    ot_profile = dataclasses.replace(profiles.OT, scan_delay=0.0)
+    asyncio.run(identify_services("10.0.0.1", [], ot_profile, udp_ports=udp_ports))
+    assert sorted(sent) == [("amplification", 19), ("iot", 1900)]  # chargen, SSDP discovery
+
+    sent.clear()
+    asyncio.run(identify_services("10.0.0.1", [], profiles.IT, udp_ports=udp_ports))
+    assert {port for module, port in sent if module == "amplification"} == {19, 123, 1900, 11211}
 
 
 # probers (patched udp I/O)

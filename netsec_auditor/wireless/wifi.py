@@ -29,18 +29,28 @@ import os
 import platform
 import re
 import shutil
+from collections.abc import Callable
 from typing import Any
 
+from netsec_auditor.discovery.passive import capture_for
 from netsec_auditor.utils.logging import get_logger
 from netsec_auditor.wireless.base import (
+    MAX_CLIENTS_PER_AP,
+    MAX_SIGHTINGS_PER_BSSID,
     AccessPoint,
     WirelessInventory,
     assess_access_point,
     band_for_channel,
+    merge_sighting,
     sanitize_name,
+    sighting_conflicts,
 )
 
 logger = get_logger(__name__)
+
+# Bounds for a live capture, so a beacon or data-frame flood cannot exhaust memory.
+_MAX_CAPTURED_APS = 4096
+_MAX_DATA_PAIRS = 65536
 
 # IEEE 802.11 suite-selector maps, keyed by the final type byte. The OUI
 # (00-0F-AC for RSN, 00-50-F2 for WPA) is checked before lookup; the type
@@ -89,7 +99,12 @@ _NMCLI_ARGV = [
 _MACOS_SSID_PLACEHOLDERS = frozenset({"<redacted>", "<private>", "<unknown ssid>"})
 
 _MAC_RE = re.compile(r"^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$")
-_IW_BSS_RE = re.compile(r"^BSS\s+([0-9a-fA-F:]{17})")
+# A BSS header exactly as iw prints it, at column 0: lower-case BSSID, the
+# interface, and an optional association status.
+_IW_BSS_RE = re.compile(
+    r"BSS (?P<bssid>[0-9a-f]{2}(?::[0-9a-f]{2}){5})\(on (?P<iface>[^\s()]+)\)"
+    r"(?: -- (?:authenticated|associated|joined|unknown status: \d+))?"
+)
 
 # Cipher tokens as `iw scan` prints them, mapped to their canonical spelling.
 _IW_CIPHER_NAMES = {
@@ -107,7 +122,8 @@ async def scan_wifi(
     Prefers scapy monitor-mode sniffing (requires scapy, root, and a monitor-mode
     adapter); otherwise, or if that yields nothing, falls back to parsing OS scan
     tools (``nmcli`` / ``iw`` on Linux, ``system_profiler`` on macOS). Never
-    raises — partial results are returned on any error.
+    raises — partial results are returned on any error. Cancelling it (Ctrl+C)
+    stops a running capture promptly and propagates the cancellation.
     """
     inventory = WirelessInventory()
 
@@ -138,36 +154,39 @@ async def scan_wifi(
 async def _scan_with_scapy(
     inventory: WirelessInventory, iface: str | None, duration: float
 ) -> None:
-    """Sniff 802.11 frames for ``duration`` seconds and fold them in."""
-    loop = asyncio.get_running_loop()
+    """Sniff 802.11 frames for ``duration`` seconds and fold them in.
+
+    Cancelling the call stops the capture promptly; nothing is added then.
+    """
+    from scapy.all import Dot11
+
+    def is_dot11(pkt: Any) -> bool:
+        return bool(pkt.haslayer(Dot11))
+
     collector = _BeaconCollector()
-    await loop.run_in_executor(None, collector.sniff, iface, duration)
+    await capture_for(
+        duration, collector.handle, iface=iface, store=False, monitor=True, lfilter=is_dot11
+    )
     collector.finalize(inventory)
 
 
 class _BeaconCollector:
-    """Accumulates APs and client associations from sniffed 802.11 frames."""
+    """Accumulates APs and client associations from sniffed 802.11 frames.
+
+    Memory is bounded: at most ``_MAX_CAPTURED_APS`` sightings and
+    ``_MAX_DATA_PAIRS`` data-frame address pairs are kept, and pairs are indexed
+    by address so attributing clients is linear in the number of pairs.
+    """
 
     def __init__(self) -> None:
-        self._aps: dict[str, AccessPoint] = {}
-        self._data_pairs: set[tuple[str, str]] = set()
+        self._aps: dict[str, list[AccessPoint]] = {}
+        self._ap_count = 0
+        self._peers: dict[str, set[str]] = {}
+        self._pair_count = 0
+        self.dropped = 0
 
-    def sniff(self, iface: str | None, duration: float) -> None:
-        """Blocking scapy monitor-mode capture; runs in a thread executor."""
-        from scapy.all import Dot11
-        from scapy.all import sniff as scapy_sniff
-
-        scapy_sniff(
-            iface=iface,
-            timeout=duration,
-            store=False,
-            monitor=True,
-            prn=self._handle,
-            lfilter=lambda pkt: pkt.haslayer(Dot11),
-        )
-
-    def _handle(self, pkt: Any) -> None:
-        """Route one frame, never raising — a bad frame must not stop capture."""
+    def handle(self, pkt: Any) -> None:
+        """Route one frame from the capture thread; a bad frame must not stop capture."""
         try:
             self._process(pkt)
         except Exception as exc:
@@ -185,34 +204,57 @@ class _BeaconCollector:
             self._track_client(dot11)
 
     def _add_ap(self, pkt: Any) -> None:
-        """Parse a Beacon/ProbeResp and merge it, keeping the strongest signal."""
+        """Parse a Beacon/ProbeResp and merge it into a compatible sighting.
+
+        A frame whose BSSID was already seen with a different encryption,
+        channel or SSID is kept as a separate sighting (a cloned-BSSID evil
+        twin would otherwise be merged away).
+        """
         ap = _parse_scapy_ap(pkt)
         if ap is None:
             return
-        existing = self._aps.get(ap.bssid)
-        if existing is None:
-            self._aps[ap.bssid] = ap
+        sightings = self._aps.get(ap.bssid, [])
+        for existing in sightings:
+            if not sighting_conflicts(existing, ap):
+                merge_sighting(existing, ap)
+                return
+        if len(sightings) >= MAX_SIGHTINGS_PER_BSSID or self._ap_count >= _MAX_CAPTURED_APS:
+            self.dropped += 1
             return
-        if ap.signal_dbm and (existing.signal_dbm == 0 or ap.signal_dbm > existing.signal_dbm):
-            existing.signal_dbm = ap.signal_dbm
-        existing.ssid = existing.ssid or ap.ssid
+        self._aps.setdefault(ap.bssid, []).append(ap)
+        self._ap_count += 1
 
     def _track_client(self, dot11: Any) -> None:
-        """Record an (addr1, addr2) pair from a data frame for later matching."""
+        """Index the two addresses of a data frame against each other."""
         addr1 = _norm_mac(getattr(dot11, "addr1", None))
         addr2 = _norm_mac(getattr(dot11, "addr2", None))
-        if addr1 and addr2 and addr1 != addr2:
-            self._data_pairs.add((addr1, addr2))
+        if not addr1 or not addr2 or addr1 == addr2:
+            return
+        if addr2 in self._peers.get(addr1, ()):
+            return
+        if self._pair_count >= _MAX_DATA_PAIRS:
+            self.dropped += 1
+            return
+        self._peers.setdefault(addr1, set()).add(addr2)
+        self._peers.setdefault(addr2, set()).add(addr1)
+        self._pair_count += 1
 
     def finalize(self, inventory: WirelessInventory) -> None:
         """Attribute clients to known APs, assess each, and add to inventory."""
-        for bssid, ap in self._aps.items():
-            for addr1, addr2 in self._data_pairs:
-                client = _client_for_bssid(bssid, addr1, addr2)
-                if client and client not in ap.clients:
-                    ap.clients.append(client)
-            ap.issues = assess_access_point(ap)
-            inventory.add_ap(ap)
+        if self.dropped:
+            logger.warning(
+                "wifi_capture_truncated",
+                dropped_frames=self.dropped,
+                max_aps=_MAX_CAPTURED_APS,
+                max_pairs=_MAX_DATA_PAIRS,
+            )
+        for bssid, sightings in self._aps.items():
+            peers = self._peers.get(bssid, set())
+            clients = sorted(peer for peer in peers if _is_unicast(peer))[:MAX_CLIENTS_PER_AP]
+            for ap in sightings:
+                ap.clients = list(clients)
+                ap.issues = assess_access_point(ap)
+                inventory.add_ap(ap)
 
 
 def _parse_scapy_ap(pkt: Any) -> AccessPoint | None:
@@ -298,15 +340,6 @@ def _privacy_enabled(pkt: Any) -> bool:
         return False
 
 
-def _client_for_bssid(bssid: str, addr1: str, addr2: str) -> str:
-    """Return the unicast client from a data-frame pair whose peer is ``bssid``."""
-    if addr1 == bssid and _is_unicast(addr2):
-        return addr2
-    if addr2 == bssid and _is_unicast(addr1):
-        return addr1
-    return ""
-
-
 # Fallback path: OS scan tools.
 
 
@@ -324,7 +357,7 @@ async def _scan_with_os_tools(inventory: WirelessInventory, iface: str | None) -
         if target:
             text = await _run_command(["iw", "dev", target, "scan"])
             if text:
-                aps = parse_iw_scan(text)
+                aps = parse_iw_scan(text, iface=target)
 
     if not aps and shutil.which("system_profiler"):
         text = await _run_command(["system_profiler", "-json", "SPAirPortDataType"])
@@ -361,6 +394,10 @@ async def _run_command(cmd: list[str], timeout: float = 20.0) -> str:
             await proc.wait()
         logger.debug("wifi_command_timeout", cmd=cmd[0])
         return ""
+    except asyncio.CancelledError:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()  # Ctrl+C must not leave the scan tool running
+        raise
     return stdout.decode("utf-8", "replace")
 
 
@@ -484,50 +521,53 @@ def _nmcli_signal_to_dbm(value: str) -> int:
 # Pure parser: `iw dev <iface> scan`.
 
 
-def parse_iw_scan(text: str) -> list[AccessPoint]:
+def parse_iw_scan(text: str, iface: str | None = None) -> list[AccessPoint]:
     """Parse `iw dev <iface> scan` output into access points.
 
     The report is split into per-BSS blocks; each block yields SSID, channel /
     frequency, signal and the RSN/WPA/WPS sections. An RSN section implies WPA2
     (or WPA3 when SAE is an authentication suite); a lone WPA section implies
     WPA1; the Privacy capability with neither implies WEP. Never raises.
+
+    iw prints WPS strings (device name, manufacturer, model, serial) verbatim,
+    so an AP can smuggle newlines and fake lines into its own block. A block
+    therefore starts only at an exact column-0 ``BSS <bssid>(on <iface>)``
+    header, bound to ``iface`` when it is given, and nothing after the start of
+    a block's WPS section is read: WPS is a vendor element, so every element
+    the parser needs precedes it in a well-formed beacon.
     """
-    aps: list[AccessPoint] = []
-    for block in _split_iw_blocks(text):
-        ap = _ap_from_iw_block(block)
-        if ap is not None:
-            aps.append(ap)
-    return aps
+    return [_ap_from_iw_block(bssid, lines) for bssid, lines in _split_iw_blocks(text, iface)]
 
 
-def _split_iw_blocks(text: str) -> list[list[str]]:
-    """Group `iw scan` lines into one list of lines per BSS."""
-    blocks: list[list[str]] = []
+def _split_iw_blocks(text: str, iface: str | None) -> list[tuple[str, list[str]]]:
+    """Group `iw scan` lines by BSS header into ``(bssid, lines)`` pairs."""
+    blocks: list[tuple[str, list[str]]] = []
     current: list[str] | None = None
-    for line in text.splitlines():
-        if _IW_BSS_RE.match(line.strip()):
-            current = [line]
-            blocks.append(current)
+    for line in text.split("\n"):  # iw ends lines with \n only; \x1c or U+2028 are not breaks
+        match = _IW_BSS_RE.fullmatch(line)
+        if match is not None and (iface is None or match.group("iface") == iface):
+            current = []
+            blocks.append((match.group("bssid").upper(), current))
         elif current is not None:
             current.append(line)
     return blocks
 
 
-def _ap_from_iw_block(block: list[str]) -> AccessPoint | None:
-    """Build an :class:`AccessPoint` from one BSS block of `iw scan` output."""
-    match = _IW_BSS_RE.match(block[0].strip())
-    if match is None:
-        return None
-    ap = AccessPoint(bssid=match.group(1).upper(), source="scan")
-    section = ""                       # "rsn" | "wpa" | "wps" | ""
+def _ap_from_iw_block(bssid: str, lines: list[str]) -> AccessPoint:
+    """Build an :class:`AccessPoint` from the lines of one BSS block."""
+    ap = AccessPoint(bssid=bssid, source="scan")
+    section = ""                       # "rsn" | "wpa" | ""
     has_rsn = has_wpa = has_wps = privacy = False
     freq = 0
     ciphers: list[str] = []
     auths: list[str] = []
 
-    for raw in block[1:]:
+    for raw in lines:
         line = raw.strip()
         low = line.lower()
+        if low.startswith("wps:"):
+            has_wps = True
+            break  # WPS strings are printed raw, so nothing from here on is trusted
         if low.startswith("ssid:"):
             ap.ssid = sanitize_name(line.split(":", 1)[1].strip())
         elif low.startswith("freq:"):
@@ -542,8 +582,6 @@ def _ap_from_iw_block(block: list[str]) -> AccessPoint | None:
             section, has_rsn = "rsn", True
         elif low.startswith("wpa:"):
             section, has_wpa = "wpa", True
-        elif low.startswith("wps:"):
-            section, has_wps = "wps", True
         elif "capability:" in low:
             privacy = "privacy" in low
             section = ""
@@ -892,7 +930,7 @@ def _as_list(value: Any) -> list[Any]:
 
 def _is_root() -> bool:
     """True only when the process can be confirmed to run as root (POSIX)."""
-    geteuid = getattr(os, "geteuid", None)
+    geteuid: Callable[[], int] | None = getattr(os, "geteuid", None)
     if geteuid is None:  # non-POSIX (e.g. Windows): cannot be root here
         return False
     return geteuid() == 0

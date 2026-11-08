@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.resources
 import json
 import os
+import stat
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -25,6 +26,23 @@ HTML_TEMPLATE = (
     .joinpath("report-template.html")
     .read_text(encoding="utf-8")
 )
+
+
+def mask_mac(value: str) -> str:
+    """Keep only the vendor OUI of a MAC, so the device is not re-identifiable.
+
+    A locally administered (randomized) address has no vendor OUI, so it is masked whole.
+    """
+    parts = value.replace("-", ":").split(":")
+    if len(parts) != 6:
+        return "[REDACTED]"
+    try:
+        first_octet = int(parts[0], 16)
+    except ValueError:
+        return "[REDACTED]"
+    if first_octet & 0x02:
+        return "xx:xx:xx:xx:xx:xx"
+    return ":".join(parts[:3] + ["xx"] * 3)
 
 
 @dataclass
@@ -96,13 +114,27 @@ class ReportGenerator:
 
     def __init__(self, output_dir: Path | None = None) -> None:
         self.output_dir = output_dir or Path("reports")
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        # Keep the report directory private (0700) whether or not it already existed:
-        # reports hold sensitive findings and their filenames leak scan targets.
+        # Only a directory created here is made private: an existing one may be shared
+        # (e.g. /tmp under sudo), and every report file is created 0600 regardless.
         try:
-            self.output_dir.chmod(0o700)
-        except OSError as exc:
-            logger.warning("report_dir_chmod_failed", path=str(self.output_dir), error=str(exc))
+            self.output_dir.mkdir(mode=0o700, parents=True)
+        except FileExistsError:
+            if not self.output_dir.is_dir():
+                raise
+            mode = self.output_dir.stat().st_mode
+            if mode & (stat.S_IWGRP | stat.S_IWOTH) and not mode & stat.S_ISVTX:
+                logger.warning(
+                    "report_dir_writable_by_others",
+                    path=str(self.output_dir),
+                    hint="other users can delete or replace these reports",
+                )
+        else:
+            try:
+                self.output_dir.chmod(0o700)
+            except OSError as exc:
+                logger.warning(
+                    "report_dir_chmod_failed", path=str(self.output_dir), error=str(exc)
+                )
 
     def build_report(
         self,
@@ -189,8 +221,8 @@ class ReportGenerator:
             for web in web_results:
                 report.total_vulnerabilities += len(web.vulnerabilities)
                 report.overall_risk_score += web.risk_score
-                for vuln in web.vulnerabilities:
-                    match vuln.severity:
+                for web_vuln in web.vulnerabilities:
+                    match web_vuln.severity:
                         case "critical":
                             report.summary.critical += 1
                         case "high":
@@ -422,14 +454,6 @@ class ReportGenerator:
             return "LOW"
         return "INFORMATIONAL"
 
-    @staticmethod
-    def _mask_mac(value: str) -> str:
-        """Keep only the vendor OUI of a MAC, so the device is not re-identifiable."""
-        parts = value.split(":")
-        if len(parts) != 6:
-            return "[REDACTED]"
-        return ":".join(parts[:3] + ["xx"] * 3)
-
     @classmethod
     def _redact_wireless(cls, entry: dict[str, Any]) -> dict[str, Any]:
         """Strip third-party identifiers from a wireless record.
@@ -442,11 +466,11 @@ class ReportGenerator:
         for key in ("bssid", "address"):
             value = redacted.get(key)
             if isinstance(value, str) and value:
-                redacted[key] = cls._mask_mac(value)
+                redacted[key] = mask_mac(value)
         clients = redacted.get("clients")
         if isinstance(clients, list):
             redacted["clients"] = [
-                cls._mask_mac(c) for c in clients if isinstance(c, str)
+                mask_mac(c) for c in clients if isinstance(c, str)
             ]
         for key in ("latitude", "longitude"):
             value = redacted.get(key)

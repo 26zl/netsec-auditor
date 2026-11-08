@@ -6,7 +6,21 @@ monitor-mode path and OS-tool subprocesses are never invoked.
 
 from __future__ import annotations
 
-from netsec_auditor.wireless.base import AccessPoint, WirelessInventory, assess_access_point
+import asyncio
+import threading
+import time
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+from netsec_auditor.wireless import wifi
+from netsec_auditor.wireless.base import (
+    AccessPoint,
+    WirelessInventory,
+    assess_access_point,
+    detect_evil_twins,
+)
 from netsec_auditor.wireless.wifi import (
     parse_airport_json,
     parse_iw_scan,
@@ -495,3 +509,192 @@ async def test_scan_wifi_skips_scapy_monitor_mode_on_macos(monkeypatch) -> None:
 
     inventory = await scan_wifi(iface=None, duration=0.0)
     assert inventory.aps() == []
+
+
+# iw output carrying raw WPS strings (iw prints them with printf("%.*s")).
+
+
+def _iw_with_wps_injection(scan_iface: str, injected_iface: str) -> str:
+    """`iw dev <scan_iface> scan` for an open rogue AP whose WPS Manufacturer string
+    smuggles a fake RSN section and a fake BSS block, next to a real WPA2 network."""
+    return (
+        f"BSS 02:11:22:33:44:55(on {scan_iface})\n"
+        "\tfreq: 2437\n"
+        "\tcapability: ESS ShortSlotTime (0x0401)\n"
+        "\tsignal: -40.00 dBm\n"
+        "\tSSID: FreeAirportWiFi\n"
+        "\tWPS:\t * Version: 1.0\n"
+        "\t\t * Manufacturer: x\n"
+        "\tRSN:\t * Version: 1\n"
+        "\t\t * Pairwise ciphers: CCMP\n"
+        "\t\t * Authentication suites: SAE\n"
+        f"BSS 66:66:66:66:66:66(on {injected_iface})\n"
+        "\tSSID: CorpWiFi\n"
+        "\tcapability: ESS (0x0001)\n"
+        "\t\t * Model: AP\n"
+        f"BSS aa:bb:cc:00:00:01(on {scan_iface})\n"
+        "\tfreq: 2437\n"
+        "\tcapability: ESS Privacy ShortSlotTime (0x0411)\n"
+        "\tSSID: CorpWiFi\n"
+        "\tRSN:\t * Version: 1\n"
+        "\t\t * Pairwise ciphers: CCMP\n"
+        "\t\t * Authentication suites: PSK\n"
+    )
+
+
+def test_parse_iw_scan_ignores_crypto_injected_through_wps_strings() -> None:
+    aps = _by_bssid(parse_iw_scan(_iw_with_wps_injection("wlan1", "wlan0"), iface="wlan1"))
+    rogue = aps["02:11:22:33:44:55"]
+    assert rogue.encryption == "open"  # the injected SAE section is not believed
+    assert rogue.wps is True
+    assert any("Open network" in issue for issue in assess_access_point(rogue))
+    # A fake header naming another interface is not a block either.
+    assert set(aps) == {"02:11:22:33:44:55", "AA:BB:CC:00:00:01"}
+
+
+def test_parse_iw_scan_accepts_only_exact_column_zero_headers() -> None:
+    text = (
+        "BSS aa:bb:cc:00:00:02(on wlan0)\n"
+        "\tSSID: Real\n"
+        "\tcapability: ESS Privacy (0x0411)\n"
+        "\tWPS:\t * Version: 1.0\n"
+        "\t\t * Device name: x\n"
+        "  BSS 66:66:66:66:66:66(on wlan0)\n"
+        "BSS 66:66:66:66:66:67(on wlan0) and more\n"
+        "\tSSID: Phantom\n"
+    )
+    assert [ap.bssid for ap in parse_iw_scan(text)] == ["AA:BB:CC:00:00:02"]
+
+
+def test_injected_copy_of_a_real_bssid_is_flagged_not_merged() -> None:
+    # A forged header that re-declares the rogue's own BSSID as WPA3 must not
+    # upgrade the real (open) observation; both are kept and flagged.
+    text = (
+        "BSS 02:11:22:33:44:55(on wlan0)\n"
+        "\tfreq: 2437\n"
+        "\tcapability: ESS ShortSlotTime (0x0401)\n"
+        "\tSSID: FreeAirportWiFi\n"
+        "\tWPS:\t * Version: 1.0\n"
+        "\t\t * Manufacturer: x\n"
+        "BSS 02:11:22:33:44:55(on wlan0)\n"
+        "\tfreq: 2437\n"
+        "\tSSID: FreeAirportWiFi\n"
+        "\tRSN:\t * Version: 1\n"
+        "\t\t * Authentication suites: SAE\n"
+    )
+    inventory = WirelessInventory()
+    for ap in parse_iw_scan(text):
+        ap.issues = assess_access_point(ap)
+        inventory.add_ap(ap)
+    detect_evil_twins(inventory.aps())
+    rows = inventory.aps()
+    assert sorted(ap.encryption for ap in rows) == ["open", "wpa3"]
+    assert all(any("cloned-BSSID" in issue for issue in ap.issues) for ap in rows)
+    open_row = next(ap for ap in rows if ap.encryption == "open")
+    assert any("Open network" in issue for issue in open_row.issues)
+
+
+# Live capture: merging, bounds and cancellation (no radio, no scapy socket).
+
+
+def _feed_beacons(monkeypatch: pytest.MonkeyPatch, aps: list[AccessPoint]) -> wifi._BeaconCollector:
+    frames = iter(aps)
+    monkeypatch.setattr(wifi, "_parse_scapy_ap", lambda _pkt: next(frames))
+    collector = wifi._BeaconCollector()
+    for _ in aps:
+        collector._add_ap(None)
+    return collector
+
+
+def test_beacon_collector_keeps_a_cloned_bssid_apart(monkeypatch: pytest.MonkeyPatch) -> None:
+    collector = _feed_beacons(monkeypatch, [
+        AccessPoint(bssid="AA:BB:CC:00:00:01", ssid="CorpWiFi", channel=6, encryption="wpa2",
+                    auth="PSK", signal_dbm=-70),
+        AccessPoint(bssid="AA:BB:CC:00:00:01", ssid="CorpWiFi", channel=6, encryption="wpa2",
+                    auth="PSK", signal_dbm=-50),
+        AccessPoint(bssid="AA:BB:CC:00:00:01", ssid="CorpWiFi", channel=11, encryption="open",
+                    signal_dbm=-30),
+    ])
+    inventory = WirelessInventory()
+    collector.finalize(inventory)
+    rows = sorted(inventory.aps(), key=lambda ap: ap.channel)
+    assert [(ap.channel, ap.encryption, ap.signal_dbm) for ap in rows] == [
+        (6, "wpa2", -50),
+        (11, "open", -30),
+    ]
+    assert all(any("cloned-BSSID" in issue for issue in ap.issues) for ap in rows)
+
+
+def test_beacon_collector_indexes_and_bounds_data_frame_pairs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(wifi, "_MAX_DATA_PAIRS", 3)
+    collector = _feed_beacons(monkeypatch, [
+        AccessPoint(bssid="AA:BB:CC:00:00:01", ssid="Net", channel=6, encryption="wpa2"),
+    ])
+    for addr1, addr2 in (
+        ("AA:BB:CC:00:00:01", "02:00:00:00:00:01"),  # client -> AP
+        ("02:00:00:00:00:02", "aa:bb:cc:00:00:01"),  # AP -> client
+        ("FF:FF:FF:FF:FF:FF", "AA:BB:CC:00:00:01"),  # broadcast is not a client
+        ("AA:BB:CC:00:00:01", "02:00:00:00:00:09"),  # over the pair limit
+    ):
+        collector._track_client(SimpleNamespace(addr1=addr1, addr2=addr2))
+    inventory = WirelessInventory()
+    collector.finalize(inventory)
+    assert inventory.aps()[0].clients == ["02:00:00:00:00:01", "02:00:00:00:00:02"]
+    assert collector.dropped == 1
+
+
+def test_beacon_collector_bounds_access_points(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(wifi, "_MAX_CAPTURED_APS", 2)
+    collector = _feed_beacons(monkeypatch, [
+        AccessPoint(bssid=f"AA:BB:CC:00:00:0{n}", ssid=f"Flood{n}", encryption="open")
+        for n in range(1, 6)
+    ])
+    inventory = WirelessInventory()
+    collector.finalize(inventory)
+    assert len(inventory.aps()) == 2
+    assert collector.dropped == 3
+
+
+class _FakeSniffer:
+    """Stand-in for scapy's AsyncSniffer: a daemon thread that runs until stopped."""
+
+    def __init__(self, **options: Any) -> None:
+        self.options = options
+        self.stop_requested = threading.Event()
+        self.thread = threading.Thread(target=self.stop_requested.wait, args=(30,), daemon=True)
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def stop(self, join: bool = True) -> None:
+        self.stop_requested.set()
+
+    def join(self, timeout: float | None = None) -> None:
+        self.thread.join(timeout)
+
+
+async def test_scapy_capture_stops_promptly_when_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sniffers: list[_FakeSniffer] = []
+
+    def factory(**options: Any) -> _FakeSniffer:
+        sniffers.append(_FakeSniffer(**options))
+        return sniffers[-1]
+
+    monkeypatch.setattr("netsec_auditor.discovery.passive._async_sniffer", factory)
+    task = asyncio.create_task(wifi._scan_with_scapy(WirelessInventory(), "wlan0mon", 30.0))
+    await asyncio.sleep(0.2)
+    cancelled_at = time.monotonic()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert time.monotonic() - cancelled_at < 1.0
+    sniffer = sniffers[0]
+    assert sniffer.stop_requested.is_set()
+    assert not sniffer.thread.is_alive()
+    assert sniffer.options["monitor"] is True
+    assert sniffer.options["store"] is False
+    assert "timeout" not in sniffer.options

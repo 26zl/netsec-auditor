@@ -20,11 +20,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
+        python-version: ["3.11", "3.12", "3.13", "3.14", "3.15"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
@@ -38,11 +40,8 @@ jobs:
       - name: Lint (ruff)
         run: ruff check .
 
-      # mypy is strict in pyproject and may need third-party stubs, so keep it
-      # advisory for now rather than blocking the whole matrix.
       - name: Type check (mypy)
         run: mypy netsec_auditor
-        continue-on-error: true
 
       - name: Test (pytest)
         run: pytest
@@ -52,14 +51,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          python-version: "3.12"
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
 
       # Fails the build on a dependency with a known advisory. Kept separate from
-      # the test matrix so a new CVE is reported once, not three times.
+      # the test matrix so a new CVE is reported once, not once per Python version.
       - name: Audit dependencies (pip-audit)
         uses: pypa/gh-action-pip-audit@1220774d901786e6f652ae159f7b6bc8fea6d266 # v1.1.0
         with:
@@ -70,21 +71,28 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
 
-      # The matrix installs with pip (the path users get); this job exists so the
-      # committed lockfile cannot silently drift from pyproject.
+      # The matrix installs with pip (the path users get); this job checks that the
+      # lockfile matches pyproject and that the locked versions pass the tests.
       - name: Verify the lockfile resolves
         run: uv sync --frozen --all-extras
+
+      - name: Test the locked versions
+        run: uv run --frozen pytest -q
 
   docker:
     name: docker image builds
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # The README documents a local image build; without this the Dockerfile can
       # break silently since nothing else exercises it.
@@ -96,4 +104,6 @@ jobs:
           tags: netsec-auditor:ci
 
       - name: Smoke-test the entrypoint
-        run: docker run --rm netsec-auditor:ci doctor
+        run: |
+          docker run --rm netsec-auditor:ci --version
+          docker run --rm netsec-auditor:ci doctor

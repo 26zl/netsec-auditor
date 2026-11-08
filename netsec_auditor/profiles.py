@@ -10,23 +10,40 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-# Well-known OT/ICS service ports (TCP unless noted).
-OT_PORTS: frozenset[int] = frozenset({
-    102,    # Siemens S7 / IEC 61850 MMS
-    502,    # Modbus/TCP
-    1089, 1090, 1091,  # Foundation Fieldbus HSE
-    1200, 2455,  # CODESYS
-    1911, 4911,  # Niagara Fox
-    2222,   # EtherNet/IP implicit I/O (UDP)
-    2404,   # IEC 60870-5-104
-    4840,   # OPC-UA
-    5094,   # HART-IP
-    9600,   # Omron FINS
-    20000,  # DNP3
-    34962, 34963, 34964,  # PROFINET
-    44818,  # EtherNet/IP explicit (CIP)
-    47808,  # BACnet/IP (UDP)
-})
+# Well-known OT/ICS service ports and the protocol each one usually carries.
+OT_PORT_NAMES: dict[int, str] = {
+    102: "s7comm/iec61850-mms",  # Siemens S7, IEC 61850 MMS (ISO-TSAP)
+    502: "modbus",
+    789: "redlion-crimson",
+    1089: "ff-hse", 1090: "ff-hse", 1091: "ff-hse",  # Foundation Fieldbus HSE
+    1200: "codesys", 2455: "codesys",
+    1911: "niagara-fox", 4911: "niagara-fox-tls",
+    1962: "pcworx",  # Phoenix Contact
+    2222: "enip-io",  # EtherNet/IP implicit I/O (UDP)
+    2404: "iec-104",  # IEC 60870-5-104
+    3671: "knxnet-ip",  # KNX building automation (UDP)
+    4840: "opcua",
+    5006: "melsec", 5007: "melsec",  # Mitsubishi MELSOFT (UDP / TCP)
+    5094: "hart-ip",
+    9600: "omron-fins",
+    18245: "ge-srtp",  # GE / Emerson PACSystems
+    20000: "dnp3",
+    20547: "proconos",
+    34962: "profinet", 34963: "profinet", 34964: "profinet",
+    44818: "enip",  # EtherNet/IP explicit messaging (CIP)
+    47808: "bacnet",  # BACnet/IP (UDP)
+    48898: "beckhoff-ads",
+}
+OT_PORTS: frozenset[int] = frozenset(OT_PORT_NAMES)
+
+# EtherTypes of layer-2 industrial protocols that never appear as IP traffic.
+OT_ETHERTYPE_NAMES: dict[int, str] = {
+    0x8892: "profinet",
+    0x88A4: "ethercat",
+    0x88AB: "powerlink",
+    0x88B8: "iec61850-goose",
+    0x88BA: "iec61850-sv",
+}
 
 # Common IoT service ports.
 IOT_PORTS: frozenset[int] = frozenset({

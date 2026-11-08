@@ -4,22 +4,28 @@ Reads a saved ``.pcap``/``.pcapng`` capture and produces two things:
 
 * a passive host/protocol inventory, built by feeding every packet through the
   existing :func:`netsec_auditor.discovery.passive.handle_packet` decoder so the
-  offline path yields exactly the same :class:`PassiveInventory` as live capture;
+  offline path yields exactly the same :class:`PassiveInventory` as live capture,
+  industrial protocols included (named OT ports, and PROFINET, EtherCAT,
+  POWERLINK and IEC 61850 GOOSE/SV stations keyed by MAC);
 * a list of cleartext-credential findings recovered from packet payloads.
 
 scapy is used only to parse the capture file and is imported lazily, so this
 module imports without it. The credential detection lives in the pure, fully
 testable :func:`scan_cleartext_credentials`, which works on raw payload bytes and
-never touches scapy or the network. Every entry point degrades to an empty result
-with a logged warning rather than raising — a malformed capture must never crash
-the caller. Recovered secrets are always redacted before they reach a finding.
+never touches scapy or the network. A file that cannot be read or is not a
+pcap/pcapng capture (a gzip-compressed one included) raises
+:class:`CaptureFormatError`; a capture that is merely cut short yields what could
+be read, with a logged warning. Recovered secrets are always redacted before they
+reach a finding.
 """
 
 from __future__ import annotations
 
 import base64
 import binascii
+import io
 import re
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -28,9 +34,23 @@ from netsec_auditor.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
+
+class CaptureFormatError(ValueError):
+    """A capture file cannot be read or is not a supported pcap/pcapng file."""
+
+
 # A payload byte length above which usernames/communities are truncated in
 # evidence, keeping findings compact and bounding any accidental disclosure.
 _EVIDENCE_LIMIT = 64
+
+# Largest single read from a capture: scapy reads a whole pcapng block at once,
+# and a forged block length must not make it allocate gigabytes.
+_MAX_RECORD_BYTES = 16 * 1024 * 1024
+# Distinct credential findings kept from one capture.
+_MAX_CREDENTIAL_FINDINGS = 10_000
+# scapy transparently inflates gzip input, which turns a small file into an
+# unbounded read, so compressed captures are refused.
+_GZIP_MAGIC = b"\x1f\x8b"
 
 # SNMP community strings that are public defaults — safe to show verbatim, since
 # reporting *which* default is in use is the whole point of the finding.
@@ -55,12 +75,36 @@ _TELNET_RE = re.compile(rb"(?:login|password|username)[ \t]*:", re.IGNORECASE)
 
 
 # Reading the capture (lazy scapy)
-def _read_packets(path: Path) -> Any:
-    """Read a capture file into a scapy ``PacketList``, or ``None`` on failure.
 
-    scapy is imported here so the module loads without it. Returns ``None`` (with
-    a clear warning) when scapy is missing or the file cannot be read/parsed, so
-    callers can degrade to an empty result instead of raising.
+
+class _BoundedReader:
+    """Binary file wrapper that refuses any single read above ``limit`` bytes."""
+
+    def __init__(self, raw: io.BufferedReader, limit: int) -> None:
+        self._raw = raw
+        self._limit = limit
+        self.name = raw.name
+
+    def read(self, size: int = -1) -> bytes:
+        if size < 0 or size > self._limit:
+            raise CaptureFormatError(
+                f"capture record of {size} bytes exceeds the {self._limit}-byte limit"
+            )
+        return self._raw.read(size)
+
+    def fileno(self) -> int:
+        return self._raw.fileno()
+
+    def close(self) -> None:
+        self._raw.close()
+
+
+def _open_capture(path: Path) -> Any:
+    """Open ``path`` as a lazily iterating scapy pcap/pcapng reader.
+
+    Returns ``None`` (with a warning) when scapy is not installed. Raises
+    :class:`CaptureFormatError` when the file cannot be read, is
+    gzip-compressed or is not a pcap/pcapng capture.
     """
     try:
         from scapy.all import PcapReader
@@ -71,29 +115,63 @@ def _read_packets(path: Path) -> Any:
             hint="pip install scapy",
         )
         return None
+    path = Path(path)
     try:
-        # PcapReader iterates lazily, so peak memory is one packet rather than
-        # the whole capture as with rdpcap.
-        return PcapReader(str(path))
-    except Exception as exc:  # scapy raises many parse/IO errors; degrade safely
-        logger.warning("pcap_read_failed", path=str(path), error=str(exc))
-        return None
+        if not path.exists():
+            raise CaptureFormatError("file not found")
+        if not path.is_file():  # a FIFO or device could block or never end
+            raise CaptureFormatError("not a regular file")
+        raw = path.open("rb")
+    except OSError as exc:
+        raise CaptureFormatError(f"cannot read file: {exc.strerror or exc}") from exc
+    try:
+        if raw.peek(2)[:2] == _GZIP_MAGIC:
+            raise CaptureFormatError(
+                "gzip-compressed captures are not supported; decompress the file first"
+            )
+        # PcapReader iterates lazily, so peak memory is one bounded record
+        # rather than the whole capture as with rdpcap.
+        return PcapReader(_BoundedReader(raw, _MAX_RECORD_BYTES))
+    except CaptureFormatError:
+        raw.close()
+        raise
+    except Exception as exc:  # scapy raises Scapy_Exception/EOFError for non-captures
+        raw.close()
+        raise CaptureFormatError(f"not a pcap/pcapng capture: {exc}") from exc
+
+
+def _packets(reader: Any, path: Path) -> Iterator[Any]:
+    """Yield packets until the end of the capture or the first unreadable record.
+
+    A record over the size bound raises :class:`CaptureFormatError`; any other
+    read error (typically a capture cut short) ends the stream with a warning.
+    """
+    try:
+        yield from reader
+    except CaptureFormatError:
+        raise
+    except Exception as exc:
+        logger.warning("pcap_scan_aborted", path=str(path), error=str(exc))
 
 
 def load_pcap(path: Path) -> PassiveInventory:
     """Read a capture file and fold every packet into a :class:`PassiveInventory`.
 
     Reuses the live-capture decoder (:func:`handle_packet`) so an offline capture
-    produces the same inventory as sniffing would. Never raises: a missing scapy,
-    an unreadable file, or a malformed packet yields an empty (or partial)
-    inventory with a logged warning.
+    produces the same inventory as sniffing would. Raises
+    :class:`CaptureFormatError` for a file that is not a readable pcap/pcapng
+    capture; a truncated capture yields a partial inventory. The reader is
+    always closed.
     """
     inventory = PassiveInventory()
-    packets = _read_packets(path)
-    if packets is None:
+    reader = _open_capture(path)
+    if reader is None:
         return inventory
-    for pkt in packets:
-        handle_packet(inventory, pkt)
+    try:
+        for pkt in _packets(reader, path):
+            handle_packet(inventory, pkt)
+    finally:
+        reader.close()
     logger.info("pcap_loaded", path=str(path), hosts=len(inventory))
     return inventory
 
@@ -137,34 +215,46 @@ def _records_from_packet(pkt: Any) -> list[tuple[str, str, int, bytes]]:
         return []
 
 
-def analyze_pcap(path: Path) -> dict:
+def analyze_pcap(path: Path) -> dict[str, Any]:
     """Analyze a capture: host inventory, cleartext credentials and packet count.
 
     Makes a single pass over the capture, folding each packet into a
     :class:`PassiveInventory` (as :func:`load_pcap` does) while collecting
     ``(src, dst, port, payload)`` records for :func:`scan_cleartext_credentials`.
-    Returns ``{"hosts", "credentials", "packet_count"}`` and never raises — a
-    missing scapy or unreadable file yields an empty, well-formed result.
+    Returns ``{"hosts", "credentials", "packet_count"}``. Identical findings are
+    reported once and at most ``_MAX_CREDENTIAL_FINDINGS`` are kept. Raises
+    :class:`CaptureFormatError` for a file that is not a readable pcap/pcapng
+    capture; a truncated capture yields a partial result.
     """
     inventory = PassiveInventory()
-    credentials: list[dict] = []
+    credentials: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    dropped = 0
     packet_count = 0
 
     # Scan credentials per packet rather than buffering every payload: a large
     # capture would otherwise be held in memory twice.
-    packets = _read_packets(path)
-    if packets is not None:
+    reader = _open_capture(path)
+    if reader is not None:
         try:
-            for pkt in packets:
+            for pkt in _packets(reader, path):
                 packet_count += 1
                 handle_packet(inventory, pkt)
-                credentials.extend(scan_cleartext_credentials(_records_from_packet(pkt)))
-        except Exception as exc:  # a truncated capture must not raise past here
-            logger.warning("pcap_scan_aborted", path=str(path), error=str(exc))
+                for finding in scan_cleartext_credentials(_records_from_packet(pkt)):
+                    key = tuple(finding.values())
+                    if key in seen:
+                        continue
+                    if len(credentials) >= _MAX_CREDENTIAL_FINDINGS:
+                        dropped += 1
+                        continue
+                    seen.add(key)
+                    credentials.append(finding)
         finally:
-            close = getattr(packets, "close", None)
-            if callable(close):
-                close()
+            reader.close()
+    if dropped:
+        logger.warning(
+            "pcap_credentials_truncated", kept=len(credentials), dropped=dropped
+        )
     logger.info(
         "pcap_analyzed",
         path=str(path),
@@ -182,7 +272,7 @@ def analyze_pcap(path: Path) -> dict:
 # Cleartext-credential detection (pure, no scapy)
 def scan_cleartext_credentials(
     records: list[tuple[str, str, int, bytes]],
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """Scan ``(src_ip, dst_ip, dst_port, payload)`` records for cleartext secrets.
 
     Pure and defensive: inspects only the payload bytes and the destination port
@@ -192,7 +282,7 @@ def scan_cleartext_credentials(
     password, base64 blob or non-default community string in the clear. Malformed
     records are skipped rather than raising.
     """
-    findings: list[dict] = []
+    findings: list[dict[str, Any]] = []
     for record in records:
         try:
             src_ip, dst_ip, dst_port, payload = record
@@ -210,9 +300,9 @@ def scan_cleartext_credentials(
 _CREDENTIAL_PORTS = frozenset({21, 23, 25, 110, 143, 161, 162, 587})
 
 
-def _scan_record(host: str, port: int, payload: bytes) -> list[dict]:
+def _scan_record(host: str, port: int, payload: bytes) -> list[dict[str, Any]]:
     """Run every applicable detector against one payload for a server ``host:port``."""
-    findings: list[dict] = []
+    findings: list[dict[str, Any]] = []
     findings.extend(_scan_http_basic(host, port, payload))
     if port == 21:
         findings.extend(_scan_user_pass("ftp", host, port, payload))
@@ -229,7 +319,7 @@ def _scan_record(host: str, port: int, payload: bytes) -> list[dict]:
     return findings
 
 
-def _finding(protocol: str, host: str, port: int, evidence: str, severity: str) -> dict:
+def _finding(protocol: str, host: str, port: int, evidence: str, severity: str) -> dict[str, Any]:
     """Build a finding record with a consistent shape."""
     return {
         "protocol": protocol,
@@ -265,7 +355,7 @@ def _b64decode(token: bytes) -> bytes | None:
         return None
 
 
-def _scan_http_basic(host: str, port: int, payload: bytes) -> list[dict]:
+def _scan_http_basic(host: str, port: int, payload: bytes) -> list[dict[str, Any]]:
     """Detect ``Authorization: Basic`` headers, showing the user and redacting the password."""
     match = _HTTP_BASIC_RE.search(payload)
     if match is None:
@@ -280,9 +370,9 @@ def _scan_http_basic(host: str, port: int, payload: bytes) -> list[dict]:
     return [_finding("http", host, port, evidence, "high")]
 
 
-def _scan_user_pass(protocol: str, host: str, port: int, payload: bytes) -> list[dict]:
+def _scan_user_pass(protocol: str, host: str, port: int, payload: bytes) -> list[dict[str, Any]]:
     """Detect line-based ``USER``/``PASS`` auth (FTP, POP3); password redacted."""
-    findings: list[dict] = []
+    findings: list[dict[str, Any]] = []
     label = protocol.upper()
     user_match = _USER_RE.search(payload)
     if user_match is not None:
@@ -294,7 +384,7 @@ def _scan_user_pass(protocol: str, host: str, port: int, payload: bytes) -> list
     return findings
 
 
-def _scan_telnet(host: str, port: int, payload: bytes) -> list[dict]:
+def _scan_telnet(host: str, port: int, payload: bytes) -> list[dict[str, Any]]:
     """Best-effort telnet tell: flag an observed cleartext login/password prompt."""
     if _TELNET_RE.search(payload) is None:
         return []
@@ -302,7 +392,7 @@ def _scan_telnet(host: str, port: int, payload: bytes) -> list[dict]:
     return [_finding("telnet", host, port, evidence, "medium")]
 
 
-def _scan_imap(host: str, port: int, payload: bytes) -> list[dict]:
+def _scan_imap(host: str, port: int, payload: bytes) -> list[dict[str, Any]]:
     """Detect an IMAP ``LOGIN`` command, showing the user and redacting the password."""
     match = _IMAP_LOGIN_RE.search(payload)
     if match is None:
@@ -312,7 +402,7 @@ def _scan_imap(host: str, port: int, payload: bytes) -> list[dict]:
     return [_finding("imap", host, port, evidence, "high")]
 
 
-def _scan_smtp(host: str, port: int, payload: bytes) -> list[dict]:
+def _scan_smtp(host: str, port: int, payload: bytes) -> list[dict[str, Any]]:
     """Detect SMTP SASL auth (``AUTH PLAIN``/``AUTH LOGIN``); password redacted."""
     plain = _SMTP_AUTH_PLAIN_RE.search(payload)
     if plain is not None:
@@ -370,7 +460,7 @@ def _snmp_community(payload: bytes) -> str | None:
     return text
 
 
-def _scan_snmp(host: str, port: int, payload: bytes) -> list[dict]:
+def _scan_snmp(host: str, port: int, payload: bytes) -> list[dict[str, Any]]:
     """Detect a cleartext SNMP community string; default communities shown, others redacted."""
     community = _snmp_community(payload)
     if community is None:

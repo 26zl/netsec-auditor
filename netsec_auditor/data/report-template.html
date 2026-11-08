@@ -253,7 +253,29 @@
                     Valid ({{ web.ssl_certificate.days_until_expiry }} days remaining)
                     {% endif %}
                 </p>
+                {% if web.ssl_certificate.issues %}
+                <ul>
+                    {% for issue in web.ssl_certificate.issues %}
+                    <li>{{ issue }}</li>
+                    {% endfor %}
+                </ul>
                 {% endif %}
+                {% endif %}
+                {% for vuln in web.vulnerabilities %}
+                <div class="vuln-detail">
+                    <h4>
+                        <span class="severity-badge severity-{{ vuln.severity }}">{{ vuln.severity }}</span>
+                        {{ vuln.name }}
+                    </h4>
+                    <p>{{ vuln.description }}</p>
+                    {% if vuln.evidence %}
+                    <div class="evidence">{{ vuln.evidence }}</div>
+                    {% endif %}
+                    {% if vuln.remediation %}
+                    <div class="remediation"><strong>Remediation:</strong> {{ vuln.remediation }}</div>
+                    {% endif %}
+                </div>
+                {% endfor %}
                 {% if web.discovered_directories %}
                 <details>
                     <summary>Discovered directories ({{ web.discovered_directories|length }})</summary>
@@ -296,11 +318,12 @@
             <h2>OT/ICS &amp; IoT Devices</h2>
             <table>
                 <thead>
-                    <tr><th>Protocol</th><th>Port</th><th>Type</th><th>Device Info</th></tr>
+                    <tr><th>Host</th><th>Protocol</th><th>Port</th><th>Type</th><th>Device Info</th></tr>
                 </thead>
                 <tbody>
                     {% for d in report.devices %}
                     <tr>
+                        <td>{{ d.extra.host or '' }}</td>
                         <td>{{ d.protocol }}</td>
                         <td>{{ d.port }}/{{ d.transport }}</td>
                         <td>{% if d.is_ot %}OT{% else %}IoT{% endif %}</td>

@@ -2,23 +2,6 @@
 # product, and version. Presence-only rules (no version/product condition) are
 # heuristics that flag exposure and should be confirmed manually or via nmap NSE.
 rules:
-  - id: "CVE-2021-44228"
-    name: "Log4Shell — Remote Code Execution (CVE-2021-44228)"
-    description: "Apache Log4j2 JNDI features do not protect against attacker-controlled LDAP and other JNDI related endpoints."
-    severity: "critical"
-    category: "cve"
-    cvss_score: 10.0
-    cve_id: "CVE-2021-44228"
-    conditions:
-      service_name: "http"
-      product: ".*[Ll]og4j.*"
-    remediation: "Upgrade to Log4j 2.17.0+ or apply vendor patches immediately."
-    references:
-      - "https://nvd.nist.gov/vuln/detail/CVE-2021-44228"
-      - "https://logging.apache.org/log4j/2.x/security.html"
-    exploit_available: true
-    metasploit_module: "exploit/multi/http/log4shell_header_injection"
-
   - id: "CVE-2021-41773"
     name: "Apache HTTP Server Path Traversal (CVE-2021-41773)"
     description: "Path traversal vulnerability in Apache HTTP Server 2.4.49 allowing directory traversal and RCE."
@@ -36,30 +19,43 @@ rules:
     exploit_available: true
 
   - id: "MYSQL-OLD"
-    name: "MySQL version potentially vulnerable"
-    description: "MySQL versions below 8.0.33 have known vulnerabilities."
+    name: "MySQL release series is end of life"
+    description: "MySQL 8.3 and older are end of life (8.0 ended on 30 April 2026) and no longer receive security fixes."
     severity: "high"
     category: "outdated_software"
     cvss_score: 7.5
     conditions:
       service_name: "mysql"
-      version_lt: "8.0.33"
-    remediation: "Upgrade MySQL to version 8.0.33 or later."
+      version_lt: "8.4"
+    remediation: "Upgrade to a supported LTS release (MySQL 8.4 or 9.7)."
     references:
-      - "https://dev.mysql.com/doc/relnotes/mysql/8.0/en/"
+      - "https://www.mysql.com/support/eol-notice.html"
+
+  - id: "MYSQL-INNOVATION-EOL"
+    name: "MySQL innovation release is end of life"
+    description: "MySQL 9.0 to 9.6 are innovation releases that are end of life and no longer receive security fixes."
+    severity: "high"
+    category: "outdated_software"
+    cvss_score: 7.5
+    conditions:
+      service_name: "mysql"
+      version: "^9\\.[0-6](?:\\.|$)"
+    remediation: "Upgrade to a supported LTS release (MySQL 9.7 or 8.4)."
+    references:
+      - "https://dev.mysql.com/doc/refman/9.7/en/mysql-releases.html"
 
   - id: "POSTGRES-OLD"
-    name: "PostgreSQL version potentially vulnerable"
-    description: "PostgreSQL versions below 15.3 have known vulnerabilities."
+    name: "PostgreSQL major version is end of life"
+    description: "PostgreSQL 14 and older are end of life (14 ends on 12 November 2026) and no longer receive security fixes."
     severity: "high"
     category: "outdated_software"
     cvss_score: 7.5
     conditions:
       service_name: "postgresql"
-      version_lt: "15.3"
-    remediation: "Upgrade PostgreSQL to version 15.3 or later."
+      version_lt: "15"
+    remediation: "Upgrade to a supported major version (PostgreSQL 15 or later)."
     references:
-      - "https://www.postgresql.org/support/security/"
+      - "https://www.postgresql.org/support/versioning/"
 
   - id: "REDIS-NO-AUTH"
     name: "Redis potentially exposed without authentication"
@@ -86,32 +82,46 @@ rules:
       - "https://www.mongodb.com/docs/manual/security/"
 
   - id: "TOMCAT-OLD"
-    name: "Apache Tomcat version potentially vulnerable"
-    description: "Apache Tomcat versions below 9.0.75 have known vulnerabilities."
+    name: "Apache Tomcat release line is end of life"
+    description: "Apache Tomcat 8.5 and older are end of life and no longer receive security fixes."
     severity: "high"
     category: "outdated_software"
     cvss_score: 7.0
     conditions:
       service_name: "http"
       product: "Apache Tomcat"
-      version_lt: "9.0.75"
-    remediation: "Upgrade Apache Tomcat to version 9.0.75 or later."
+      version_lt: "9.0"
+    remediation: "Upgrade to a supported release line (Tomcat 9.0, 10.1 or 11.0)."
     references:
-      - "https://tomcat.apache.org/security.html"
+      - "https://tomcat.apache.org/whichversion.html"
+
+  - id: "TOMCAT-10.0-EOL"
+    name: "Apache Tomcat 10.0 is end of life"
+    description: "Apache Tomcat 10.0 reached end of life on 31 October 2022 and no longer receives security fixes."
+    severity: "high"
+    category: "outdated_software"
+    cvss_score: 7.0
+    conditions:
+      service_name: "http"
+      product: "Apache Tomcat"
+      version: "^10\\.0(?:\\.|$)"
+    remediation: "Upgrade to Tomcat 10.1 or 11.0."
+    references:
+      - "https://tomcat.apache.org/whichversion.html"
 
   - id: "NGINX-OLD"
-    name: "nginx version potentially vulnerable"
-    description: "nginx versions below 1.24.0 have known vulnerabilities."
+    name: "nginx branch is no longer supported"
+    description: "nginx releases older than the 1.30 stable branch no longer receive security fixes."
     severity: "medium"
     category: "outdated_software"
     cvss_score: 5.0
     conditions:
       service_name: "http"
       product: "nginx"
-      version_lt: "1.24.0"
-    remediation: "Upgrade nginx to version 1.24.0 or later."
+      version_lt: "1.30"
+    remediation: "Upgrade to the current stable (1.30) or mainline (1.31) branch."
     references:
-      - "https://nginx.org/en/security_advisories.html"
+      - "https://nginx.org/en/download.html"
 
   - id: "RDP-EXPOSED"
     name: "RDP exposed — verify Network Level Authentication"

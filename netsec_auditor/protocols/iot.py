@@ -10,6 +10,7 @@ without a live device.
 from __future__ import annotations
 
 import re
+import ssl
 import struct
 
 from netsec_auditor.protocols.base import (
@@ -98,10 +99,20 @@ def parse_mqtt_response(data: bytes) -> dict[str, str]:
     }
 
 
-async def probe_mqtt(host: str, port: int, timeout: float) -> ProbeResult | None:
-    """Identify an MQTT broker by sending CONNECT and reading the CONNACK."""
+def _unverified_tls_context() -> ssl.SSLContext:
+    """Client context without certificate checks; the probe only identifies the broker."""
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    return context
+
+
+async def _run_mqtt(host: str, port: int, timeout: float, *, tls: bool) -> ProbeResult | None:
     try:
-        data = await tcp_request(host, port, build_mqtt_request(), timeout)
+        ssl_context = _unverified_tls_context() if tls else None
+        data = await tcp_request(
+            host, port, build_mqtt_request(), timeout, ssl_context=ssl_context
+        )
         if not data:
             return None
         info = parse_mqtt_response(data)
@@ -115,11 +126,21 @@ async def probe_mqtt(host: str, port: int, timeout: float) -> ProbeResult | None
             banner=f"MQTT broker (CONNACK {info['return_code']})",
         )
         result.extra["anonymous_accepted"] = info["anonymous_accepted"] == "true"
-        if port == 8883:  # 8883 is MQTT-over-TLS; we probe in the clear and note it
+        if tls:
             result.extra["tls"] = True
         return result
     except Exception:
         return None
+
+
+async def probe_mqtt(host: str, port: int, timeout: float) -> ProbeResult | None:
+    """Identify an MQTT broker by sending CONNECT and reading the CONNACK."""
+    return await _run_mqtt(host, port, timeout, tls=False)
+
+
+async def probe_mqtt_tls(host: str, port: int, timeout: float) -> ProbeResult | None:
+    """Identify an MQTT-over-TLS broker with the same CONNECT inside a TLS session."""
+    return await _run_mqtt(host, port, timeout, tls=True)
 
 
 # CoAP (RFC 7252) — UDP 5683
@@ -235,10 +256,14 @@ async def probe_coap(host: str, port: int, timeout: float) -> ProbeResult | None
 def build_ssdp_request(
     host: str = "239.255.255.250",
     port: int = 1900,
-    st: str = "ssdp:all",
+    st: str = "upnp:rootdevice",
     mx: int = 1,
 ) -> bytes:
-    """Build an HTTP-over-UDP SSDP ``M-SEARCH`` discovery request."""
+    """Build an HTTP-over-UDP SSDP ``M-SEARCH`` discovery request.
+
+    The default search target draws one reply per root device, whereas ``ssdp:all``
+    draws one per device and service, the multi-datagram reply reflectors exploit.
+    """
     lines = [
         "M-SEARCH * HTTP/1.1",
         f"HOST: {host}:{port}",
@@ -264,7 +289,7 @@ def parse_ssdp_response(data: bytes) -> dict[str, str]:
 
 
 async def probe_ssdp(host: str, port: int, timeout: float) -> ProbeResult | None:
-    """Identify a UPnP device via a unicast SSDP ``M-SEARCH``."""
+    """Identify a UPnP device via a unicast SSDP ``M-SEARCH`` for its root device."""
     try:
         data = await udp_request(host, port, build_ssdp_request(host, port), timeout)
         if not data:
@@ -286,6 +311,8 @@ async def probe_ssdp(host: str, port: int, timeout: float) -> ProbeResult | None
 # mDNS / DNS-SD — UDP 5353
 
 _DNS_SD_SERVICES = "_services._dns-sd._udp.local"
+_DNS_MAX_NAME_OCTETS = 255
+_MDNS_MAX_SERVICES = 64
 
 
 def _dns_encode_name(name: str) -> bytes:
@@ -302,10 +329,15 @@ def _dns_encode_name(name: str) -> bytes:
 
 
 def _dns_read_name(data: bytes, offset: int) -> tuple[int, str]:
-    """Decode a DNS name, following compression pointers; return (next_offset, name)."""
+    """Decode a DNS name, following compression pointers; return (next_offset, name).
+
+    Each pointer must land before the label run it ends, and a name stops at the
+    RFC 1035 limit of 255 octets, so hostile replies cannot loop or inflate names.
+    """
     labels: list[str] = []
     next_offset: int | None = None
-    jumps = 0
+    run_start = offset
+    name_octets = 0
     while 0 <= offset < len(data):
         length = data[offset]
         if length == 0:  # zero-length label ends the name
@@ -318,11 +350,14 @@ def _dns_read_name(data: bytes, offset: int) -> tuple[int, str]:
                 break
             if next_offset is None:
                 next_offset = offset + 2  # resume after the 2-byte pointer
-            offset = ((length & 0x3F) << 8) | data[offset + 1]
-            jumps += 1
-            if jumps > 128:  # guard against pointer loops in hostile input
+            target = ((length & 0x3F) << 8) | data[offset + 1]
+            if target >= run_start:
                 break
+            offset = run_start = target
             continue
+        name_octets += length + 1
+        if name_octets > _DNS_MAX_NAME_OCTETS:
+            break
         offset += 1
         labels.append(data[offset : offset + length].decode("ascii", "replace"))
         offset += length
@@ -359,6 +394,8 @@ def _mdns_services(data: bytes) -> list[str]:
             _, target = _dns_read_name(data, offset)
             if target:
                 services.append(target)
+                if len(services) >= _MDNS_MAX_SERVICES:
+                    break
         offset += rdlen
     return services
 
@@ -446,7 +483,7 @@ async def probe_rtsp(host: str, port: int, timeout: float) -> ProbeResult | None
 
 SPECS: list[ProbeSpec] = [
     ProbeSpec("mqtt", 1883, "tcp", False, probe_mqtt),
-    ProbeSpec("mqtt-tls", 8883, "tcp", False, probe_mqtt),
+    ProbeSpec("mqtt-tls", 8883, "tcp", False, probe_mqtt_tls),
     ProbeSpec("coap", 5683, "udp", False, probe_coap),
     ProbeSpec("ssdp", 1900, "udp", False, probe_ssdp),
     ProbeSpec("mdns", 5353, "udp", False, probe_mdns),

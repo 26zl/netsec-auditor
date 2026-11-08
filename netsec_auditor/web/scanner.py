@@ -9,6 +9,7 @@ import ipaddress
 import re
 import ssl
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
@@ -18,12 +19,15 @@ from urllib.parse import ParseResult, parse_qsl, urlencode, urljoin, urlparse, u
 import httpx
 from bs4 import BeautifulSoup
 from cryptography import x509
+from cryptography.exceptions import UnsupportedAlgorithm
 
 from netsec_auditor.scanner.scope import Scope, ScopeError
 from netsec_auditor.utils.hashing import short_id
 from netsec_auditor.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+_DEV_MARKER = re.compile(r"TODO|FIXME|HACK|BUG", re.IGNORECASE)
 
 
 def _is_ip_literal(host: str) -> bool:
@@ -341,7 +345,7 @@ class WebScanner:
                     return HTTPResponse(
                         status_code=resp.status_code,
                         headers=self._sanitize_headers(resp.headers),
-                        body=bytes(content).decode(resp.encoding or "utf-8", "replace"),
+                        body=self._decode_body(bytes(content), resp.encoding),
                         body_size=len(content),
                         response_time=time.monotonic() - started,
                         redirect_chain=redirect_chain,
@@ -355,6 +359,14 @@ class WebScanner:
             logger.debug("request_out_of_scope", url=self._redact_url(url))
             return None
         return None
+
+    @staticmethod
+    def _decode_body(content: bytes, encoding: str | None) -> str:
+        """Decode a body; a server can declare a codec that is not text (rot13, hex, idna)."""
+        try:
+            return content.decode(encoding or "utf-8", "replace")
+        except (LookupError, UnicodeError):
+            return content.decode("utf-8", "replace")
 
     def _validate_url(self, url: str) -> tuple[ParseResult, str | None]:
         """Validate URL syntax, scope, and port; return ``(parsed, pin_ip)``.
@@ -557,16 +569,23 @@ class WebScanner:
                 "AWS access key in response",
                 "Remove AWS keys and rotate immediately",
             ),
-            r"<!--.*?(?:TODO|FIXME|HACK|BUG).*?-->": (
-                "low",
-                "Developer comments in HTML source",
-                "Remove development comments from production code",
-            ),
         }
+        hits = [
+            (severity, description, remediation, len(re.findall(pattern, response.body, re.I)))
+            for pattern, (severity, description, remediation) in patterns.items()
+        ]
+        dev_comments = sum(
+            1 for comment in self._html_comments(response.body) if _DEV_MARKER.search(comment)
+        )
+        hits.append((
+            "low",
+            "Developer comments in HTML source",
+            "Remove development comments from production code",
+            dev_comments,
+        ))
 
-        for pattern, (severity, description, remediation) in patterns.items():
-            matches = re.findall(pattern, response.body, re.IGNORECASE)
-            for index, _match in enumerate(matches[:3]):
+        for severity, description, remediation, count in hits:
+            for index in range(min(count, 3)):
                 vulns.append(
                     WebVulnerability(
                         id=f"INFO-DISC-{short_id(f'{url}:{description}:{index}')}",
@@ -581,6 +600,17 @@ class WebScanner:
                 )
 
         return vulns
+
+    @staticmethod
+    def _html_comments(body: str) -> Iterator[str]:
+        """Yield the text of each complete HTML comment in a single linear pass."""
+        start = body.find("<!--")
+        while start != -1:
+            end = body.find("-->", start + 4)
+            if end == -1:
+                return
+            yield body[start + 4 : end]
+            start = body.find("<!--", end + 3)
 
     async def _check_http_methods(
         self, url: str, finding_url: str | None = None
@@ -711,7 +741,7 @@ class WebScanner:
 
         result = await scan_tls(hostname, port, self.timeout, connect_host=connect_host)
         vulns: list[WebVulnerability] = []
-        for finding in result.get("findings", []):
+        for finding in result["findings"]:
             digest = short_id(finding["name"] + url)
             vulns.append(
                 WebVulnerability(
@@ -765,7 +795,10 @@ class WebScanner:
                 ),
                 timeout=self.timeout,
             )
-            cert_bin = writer.get_extra_info("ssl_object").getpeercert(binary_form=True)
+            ssl_object = writer.get_extra_info("ssl_object")
+            cert_bin: bytes | None = (
+                ssl_object.getpeercert(binary_form=True) if ssl_object else None
+            )
             writer.close()
             await writer.wait_closed()
             return cert_bin
@@ -821,13 +854,22 @@ class WebScanner:
         try:
             san_ext = x.extensions.get_extension_for_class(x509.SubjectAlternativeName)
             cert.san = san_ext.value.get_values_for_type(x509.DNSName)
-        except x509.ExtensionNotFound:
+        except (x509.ExtensionNotFound, ValueError):
             cert.san = []
 
-        key = x.public_key()
-        cert.key_size = getattr(key, "key_size", 0)
-        if x.signature_hash_algorithm:
-            cert.signature_algorithm = x.signature_hash_algorithm.name
+        # Legacy or regional devices present keys and signatures (MD2, SM2) that the
+        # crypto backend cannot load; report what is known instead of aborting the scan.
+        try:
+            cert.key_size = getattr(x.public_key(), "key_size", 0)
+        except (UnsupportedAlgorithm, ValueError):
+            cert.key_size = 0
+        try:
+            hash_algorithm = x.signature_hash_algorithm
+        except UnsupportedAlgorithm:
+            cert.signature_algorithm = x.signature_algorithm_oid.dotted_string
+        else:
+            if hash_algorithm:
+                cert.signature_algorithm = hash_algorithm.name
 
         if cert.is_expired:
             cert.issues.append("Certificate has expired")
@@ -915,7 +957,7 @@ class WebScanner:
 
             for tag in soup.find_all(["a", "link", "script", "img", "iframe", "source"]):
                 href = tag.get("href") or tag.get("src")
-                if not href:
+                if not isinstance(href, str) or not href:
                     continue
                 if href.startswith(("javascript:", "mailto:", "tel:", "data:", "#")):
                     continue
