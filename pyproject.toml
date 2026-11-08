@@ -103,8 +103,10 @@ warn_unused_ignores = true
 module = ["scapy.*"]
 follow_imports = "skip"
 
+# python-nmap has no stubs; bleak and weasyprint are optional extras that a plain
+# ".[dev]" install leaves out (CI type-checks them with all extras in the lockfile job).
 [[tool.mypy.overrides]]
-module = ["nmap", "weasyprint"]
+module = ["nmap", "bleak", "bleak.*", "weasyprint"]
 ignore_missing_imports = true
 
 [tool.pyright]

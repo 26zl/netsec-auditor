@@ -82,6 +82,9 @@ jobs:
       - name: Verify the lockfile resolves
         run: uv sync --frozen --all-extras
 
+      - name: Type check with every optional extra installed
+        run: uv run --frozen mypy netsec_auditor
+
       - name: Test the locked versions
         run: uv run --frozen pytest -q
 
